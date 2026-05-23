@@ -29,3 +29,37 @@ export class DataLayerError extends Error {
     this.cause = args.cause;
   }
 }
+
+/**
+ * Subclass for "the row exists but is in the wrong state for this
+ * operation" (e.g. trying to approve a plan that is already
+ * 'approved'). Translated to HTTP 409 by `toErrorResponse`.
+ */
+export class ConflictError extends DataLayerError {
+  constructor(args: {
+    module: string;
+    operation: string;
+    message: string;
+    cause?: unknown;
+  }) {
+    super(args);
+    this.name = "ConflictError";
+  }
+}
+
+/**
+ * Subclass for "no row with that id". Translated to HTTP 404 by
+ * `toErrorResponse`. Use for read-then-write paths where a missing
+ * row is a client error (bad id), not a server error.
+ */
+export class NotFoundError extends DataLayerError {
+  constructor(args: {
+    module: string;
+    operation: string;
+    message: string;
+    cause?: unknown;
+  }) {
+    super(args);
+    this.name = "NotFoundError";
+  }
+}

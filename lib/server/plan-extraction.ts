@@ -1,5 +1,3 @@
-import "server-only";
-
 import { z } from "zod";
 
 /**
@@ -16,6 +14,11 @@ import { z } from "zod";
  * agent is instructed to use `null` rather than omitting a field, so
  * approvers see "agent looked, found nothing" rather than "agent
  * didn't bother to look".
+ *
+ * No `server-only` here on purpose: the schema is pure data + Zod, so
+ * the human-approval form in `plan-detail-client.tsx` can import the
+ * same shape and the same Zod validator. One source of truth for the
+ * agent, the route handlers, and the UI.
  */
 export const extractedPlanFieldsSchema = z.object({
   company_name: z.string().min(1),
@@ -141,3 +144,64 @@ export const extractedPlanFieldsJsonSchema = {
   ],
   additionalProperties: false,
 } as const;
+
+/**
+ * UI rendering hints for the human-approval form. Keep this map in
+ * sync with `extractedPlanFieldsSchema` -- if you add a field above,
+ * add a row here too or the form will silently treat it as a plain
+ * text input.
+ *
+ * `kind` controls the input element:
+ *   - `text`     : <input type="text">
+ *   - `textarea` : <textarea> for multi-line / long-form values
+ *   - `number`   : <input type="number"> for floats
+ *   - `integer`  : <input type="number" step="1"> for whole numbers
+ *   - `boolean`  : <input type="checkbox">
+ *
+ * `nullable` lets the form treat empty input as `null` (matches the
+ * Zod `.nullable()` modifiers on the schema). `hint` is a short string
+ * shown next to fields whose format isn't obvious (EIN regex, ISO
+ * dates, percent strings).
+ */
+export type ExtractedPlanFieldUiKind =
+  | "text"
+  | "textarea"
+  | "number"
+  | "integer"
+  | "boolean";
+
+export type ExtractedPlanFieldUiHint = {
+  kind: ExtractedPlanFieldUiKind;
+  nullable?: boolean;
+  hint?: string;
+};
+
+export const extractedPlanFieldUiHints: Record<
+  keyof ExtractedPlanFields,
+  ExtractedPlanFieldUiHint
+> = {
+  company_name: { kind: "text" },
+  plan_name: { kind: "text" },
+  ein: { kind: "text", hint: "NN-NNNNNNN" },
+  plan_effective_date: { kind: "text", hint: "YYYY-MM-DD" },
+  plan_year_end: { kind: "text", hint: "MM-DD" },
+  eligibility: { kind: "textarea" },
+  entry_dates: { kind: "textarea" },
+  auto_enrollment: { kind: "boolean" },
+  default_deferral_rate: { kind: "text", hint: 'Percent string, e.g. "3%"' },
+  auto_escalation: { kind: "boolean" },
+  auto_escalation_detail: { kind: "textarea", nullable: true },
+  employer_match: { kind: "textarea" },
+  max_match_percentage: { kind: "text", hint: 'Percent string, e.g. "4%"' },
+  vesting_schedule: { kind: "textarea" },
+  safe_harbor: { kind: "boolean" },
+  roth_allowed: { kind: "boolean" },
+  loans_allowed: { kind: "boolean" },
+  loan_max_outstanding: { kind: "integer", nullable: true },
+  loan_cap: { kind: "number", nullable: true },
+  payroll_frequency: { kind: "text" },
+  payroll_provider: { kind: "text", nullable: true },
+  recordkeeper: { kind: "text", nullable: true },
+  tpa: { kind: "text", nullable: true },
+  advisor: { kind: "text", nullable: true },
+};

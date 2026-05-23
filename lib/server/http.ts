@@ -2,17 +2,26 @@ import "server-only";
 
 import { z, ZodError } from "zod";
 
-import { DataLayerError } from "@/lib/server/errors";
+import {
+  ConflictError,
+  DataLayerError,
+  NotFoundError,
+} from "@/lib/server/errors";
 
 /**
  * Translate any error thrown by a data-access call into a Response.
  *
  *   - ZodError              -> 400 with the field-level issues exposed.
+ *   - NotFoundError         -> 404 with the module/operation tag.
+ *   - ConflictError         -> 409 with the module/operation tag.
  *   - DataLayerError        -> 500 with the module/operation tag (and
  *                              the message, since we authored it and
  *                              it's safe to surface).
  *   - everything else       -> 500 with a generic message; the real
  *                              cause is logged server-side.
+ *
+ * NotFoundError and ConflictError are checked before the general
+ * DataLayerError branch since they extend it.
  *
  * Keep this thin -- Route Handlers should be a 3-line shape:
  *   try { ... return Response.json(result) }
@@ -29,6 +38,30 @@ export function toErrorResponse(err: unknown): Response {
         })),
       },
       { status: 400 },
+    );
+  }
+
+  if (err instanceof NotFoundError) {
+    return Response.json(
+      {
+        error: "not_found",
+        module: err.module,
+        operation: err.operation,
+        message: err.message,
+      },
+      { status: 404 },
+    );
+  }
+
+  if (err instanceof ConflictError) {
+    return Response.json(
+      {
+        error: "conflict",
+        module: err.module,
+        operation: err.operation,
+        message: err.message,
+      },
+      { status: 409 },
     );
   }
 

@@ -2,7 +2,15 @@ import "server-only";
 
 import { z } from "zod";
 
-import { DataLayerError } from "@/lib/server/errors";
+import {
+  ConflictError,
+  DataLayerError,
+  NotFoundError,
+} from "@/lib/server/errors";
+import {
+  extractedPlanFieldsSchema,
+  type ExtractedPlanFields,
+} from "@/lib/server/plan-extraction";
 import { getSupabaseServiceRoleClient } from "@/lib/server/supabase";
 
 /**
@@ -181,4 +189,170 @@ export async function updateExtractedFields(
   }
 
   return data as PlanRow;
+}
+
+/**
+ * Approve the agent's extracted fields, optionally with human edits.
+ *
+ * The human approver's edits go through `extractedPlanFieldsSchema` so
+ * a manually-fixed EIN that still doesn't match `NN-NNNNNNN` is
+ * rejected here instead of slipping through. `approver_name` and
+ * `reason` are validated but not stored on the plan -- the route
+ * handler writes them into the `PLAN_DETAILS_APPROVED` audit row.
+ *
+ * Status transition is atomic: the UPDATE is filtered on
+ * `extraction_status='in_review'`, so two simultaneous approves can't
+ * both succeed (the second one returns no row and we raise). Also
+ * flips `plans.status` to 'active' since this is the only onboarding
+ * gate today; revisit once Payroll Reconciliation adds more.
+ */
+export const approveExtractedFieldsInputSchema = z.object({
+  extracted_fields: extractedPlanFieldsSchema,
+  approver_name: z.string().min(1),
+  reason: z.string().min(1).max(2000).optional(),
+});
+
+export type ApproveExtractedFieldsInput = z.infer<
+  typeof approveExtractedFieldsInputSchema
+>;
+
+export type ApproveExtractedFieldsResult = {
+  plan: PlanRow;
+  before: Record<string, unknown>;
+  after: ExtractedPlanFields;
+};
+
+export async function approveExtractedFields(
+  id: string,
+  input: ApproveExtractedFieldsInput,
+): Promise<ApproveExtractedFieldsResult> {
+  uuid.parse(id);
+  const parsed = approveExtractedFieldsInputSchema.parse(input);
+
+  const prev = await getPlan(id);
+  if (!prev) {
+    throw new NotFoundError({
+      module: "plans",
+      operation: "approveExtractedFields",
+      message: `no plans row with id ${id}`,
+    });
+  }
+  if (prev.extraction_status !== "in_review") {
+    throw new ConflictError({
+      module: "plans",
+      operation: "approveExtractedFields",
+      message: `plan ${id} is not in_review (got ${prev.extraction_status})`,
+    });
+  }
+
+  const supabase = getSupabaseServiceRoleClient();
+  const { data, error } = await supabase
+    .from("plans")
+    .update({
+      extracted_fields: parsed.extracted_fields,
+      extraction_status: "approved",
+      status: "active",
+    })
+    .eq("id", id)
+    .eq("extraction_status", "in_review")
+    .select("*")
+    .maybeSingle();
+
+  if (error) {
+    throw new DataLayerError({
+      module: "plans",
+      operation: "approveExtractedFields",
+      message: error.message,
+      cause: error,
+    });
+  }
+  if (!data) {
+    throw new ConflictError({
+      module: "plans",
+      operation: "approveExtractedFields",
+      message: `plan ${id} status changed before approval could land (no longer in_review)`,
+    });
+  }
+
+  return {
+    plan: data as PlanRow,
+    before: prev.extracted_fields,
+    after: parsed.extracted_fields,
+  };
+}
+
+/**
+ * Reject the agent's extracted fields. Flips `extraction_status` to
+ * 'failed'. `plans.status` is left unchanged -- the operator can
+ * re-run extraction on a different file or fix the document; we don't
+ * archive the plan automatically.
+ *
+ * Same atomic-update contract as `approveExtractedFields`.
+ */
+export const rejectExtractedFieldsInputSchema = z.object({
+  approver_name: z.string().min(1),
+  reason: z.string().min(1).max(2000),
+});
+
+export type RejectExtractedFieldsInput = z.infer<
+  typeof rejectExtractedFieldsInputSchema
+>;
+
+export type RejectExtractedFieldsResult = {
+  plan: PlanRow;
+  before: Record<string, unknown>;
+};
+
+export async function rejectExtractedFields(
+  id: string,
+  input: RejectExtractedFieldsInput,
+): Promise<RejectExtractedFieldsResult> {
+  uuid.parse(id);
+  rejectExtractedFieldsInputSchema.parse(input);
+
+  const prev = await getPlan(id);
+  if (!prev) {
+    throw new NotFoundError({
+      module: "plans",
+      operation: "rejectExtractedFields",
+      message: `no plans row with id ${id}`,
+    });
+  }
+  if (prev.extraction_status !== "in_review") {
+    throw new ConflictError({
+      module: "plans",
+      operation: "rejectExtractedFields",
+      message: `plan ${id} is not in_review (got ${prev.extraction_status})`,
+    });
+  }
+
+  const supabase = getSupabaseServiceRoleClient();
+  const { data, error } = await supabase
+    .from("plans")
+    .update({ extraction_status: "failed" })
+    .eq("id", id)
+    .eq("extraction_status", "in_review")
+    .select("*")
+    .maybeSingle();
+
+  if (error) {
+    throw new DataLayerError({
+      module: "plans",
+      operation: "rejectExtractedFields",
+      message: error.message,
+      cause: error,
+    });
+  }
+  if (!data) {
+    throw new ConflictError({
+      module: "plans",
+      operation: "rejectExtractedFields",
+      message: `plan ${id} status changed before rejection could land (no longer in_review)`,
+    });
+  }
+
+  return {
+    plan: data as PlanRow,
+    before: prev.extracted_fields,
+  };
 }

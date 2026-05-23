@@ -20,6 +20,11 @@ import {
   type PayrollRunRow,
 } from "@/lib/server/payroll-runs";
 import { getPlan } from "@/lib/server/plans";
+import { listIssuesForPlan } from "@/lib/server/reconciliation-issues";
+import {
+  listSuggestedFixesForIssue,
+  type SuggestedFixRow,
+} from "@/lib/server/suggested-fixes";
 
 // The page reads the live plan + files at request time so the operator
 // always sees the current `extraction_status`. Static prerender would
@@ -76,13 +81,29 @@ export default async function PlanDetailPage({
     payrollRuns,
     pendingMapping,
     approvedMapping,
+    issues,
   ] = await Promise.all([
     listFilesForPlan(id),
     listParticipants({ plan_id: id, limit: 200 }),
     listPayrollRunsForPlan(id),
     getLatestPendingMappingForPlan(id),
     getLatestApprovedMapping(id),
+    listIssuesForPlan(id),
   ]);
+
+  // Only open issues need their suggested fixes loaded -- terminal
+  // (resolved / ignored) issues display the historical outcome but
+  // don't surface inline approve/reject controls. Fan out one query
+  // per open issue in parallel so a plan with many issues doesn't
+  // serialize the per-issue fetches.
+  const openIssues = issues.filter((i) => i.status === "open");
+  const fixListsForOpenIssues = await Promise.all(
+    openIssues.map((i) => listSuggestedFixesForIssue(i.id)),
+  );
+  const fixesByIssueId: Record<string, SuggestedFixRow[]> = {};
+  openIssues.forEach((issue, idx) => {
+    fixesByIssueId[issue.id] = fixListsForOpenIssues[idx];
+  });
 
   const planForClient: PlanDetailPlan = {
     id: plan.id,
@@ -136,6 +157,8 @@ export default async function PlanDetailPage({
         payrollRuns={payrollRunsForClient}
         pendingMapping={pendingMappingForClient}
         approvedMapping={approvedMappingForClient}
+        issues={issues}
+        fixesByIssueId={fixesByIssueId}
       />
     </div>
   );

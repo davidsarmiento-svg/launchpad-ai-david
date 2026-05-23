@@ -18,6 +18,14 @@ import {
   extractedPlanFieldsSchema,
 } from "@/lib/server/plan-extraction";
 import { updateExtractedFields } from "@/lib/server/plans";
+import {
+  reconciliationIssueInputSchema,
+  reconciliationIssueJsonSchema,
+  suggestedFixInputSchema,
+  suggestedFixJsonSchema,
+} from "@/lib/server/reconciliation";
+import { createReconciliationIssue } from "@/lib/server/reconciliation-issues";
+import { createSuggestedFix } from "@/lib/server/suggested-fixes";
 
 /**
  * Tool registry for the Claude tool-use loop.
@@ -741,6 +749,318 @@ const flagMappingIssue: ToolDefinition<FlagMappingIssueInput> = {
 };
 
 // ---------------------------------------------------------------------------
+// propose_reconciliation_issue
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-call payload for the Payroll Reconciliation Agent. The agent
+ * emits one of these for every distinct problem it spots in a
+ * payroll run. The handler inserts the `reconciliation_issues` row
+ * and, when `suggested_fix` is included, also inserts the matching
+ * `suggested_fixes` row in the same call so the human reviewer sees
+ * the proposed correction inline.
+ *
+ * `payroll_run_id` is `.nullable()` (not `.optional()`) so the agent
+ * must explicitly send `null` for the rare plan-scoped issue that
+ * isn't tied to a specific run. The runner today only invokes this
+ * with a run id, but the column on `reconciliation_issues` already
+ * accepts NULL post-Phase 9.1 migration.
+ *
+ * `payroll_record_id` is `.optional().nullable()` because the agent
+ * usually anchors on (row_number, run) rather than the DB row id;
+ * the runner can leave this null and the DAL will keep it null.
+ */
+const proposeReconciliationIssueInputSchema = z.object({
+  plan_id: z.string().uuid(),
+  payroll_run_id: z.string().uuid().nullable(),
+  payroll_record_id: z.string().uuid().nullable().optional(),
+  issue: reconciliationIssueInputSchema,
+  suggested_fix: suggestedFixInputSchema.nullable().optional(),
+});
+
+type ProposeReconciliationIssueInput = z.infer<
+  typeof proposeReconciliationIssueInputSchema
+>;
+
+const proposeReconciliationIssue: ToolDefinition<ProposeReconciliationIssueInput> = {
+  name: "propose_reconciliation_issue",
+  description:
+    "Persist a detected reconciliation issue for human review. The " +
+    "issue lands in 'open' status. Optionally include an inline " +
+    "suggested_fix when the corrected value is unambiguous and the " +
+    "proposed_changes payload is well-formed; otherwise omit it and " +
+    "the human will triage manually. Call this once per distinct " +
+    "issue. Do not batch multiple issues into one call.",
+  inputJsonSchema: {
+    type: "object",
+    properties: {
+      plan_id: {
+        type: "string",
+        description: "uuid of the plans row this issue belongs to.",
+      },
+      payroll_run_id: {
+        type: ["string", "null"],
+        description:
+          "uuid of the payroll_runs row this issue belongs to, or " +
+          "null for plan-scoped issues with no single owning run.",
+      },
+      payroll_record_id: {
+        type: ["string", "null"],
+        description:
+          "Optional uuid of the payroll_records row when the issue " +
+          "anchors directly to a stored DB row. Most agents leave " +
+          "this null and identify the row via issue.row_number.",
+      },
+      issue: reconciliationIssueJsonSchema,
+      suggested_fix: {
+        anyOf: [suggestedFixJsonSchema, { type: "null" as const }],
+        description:
+          "Optional inline suggested fix. Include only when the " +
+          "corrected value is unambiguous and you can build a valid " +
+          "proposed_changes payload. Omit (or send null) to let a " +
+          "human triage the issue manually.",
+      },
+    },
+    required: ["plan_id", "payroll_run_id", "issue"],
+    additionalProperties: false,
+  },
+  inputSchema: proposeReconciliationIssueInputSchema,
+  async handler(input, ctx) {
+    try {
+      // Self-contradiction guard. The skill anti-pattern #9 forbids the
+      // agent from emitting an issue whose own agent_explanation says
+      // the check passed. Live agent runs occasionally violate this
+      // (the model narrates "no issue to emit" but still calls the
+      // tool). We refuse the insert at the boundary so the model gets
+      // a clear tool error and can move on without polluting the DB.
+      // The phrase list is intentionally narrow to avoid catching
+      // legitimate explanations that mention these words in passing.
+      const explanation = input.issue.agent_explanation.toLowerCase();
+      const selfContradictingPhrases = [
+        "no issue to emit",
+        "no issue exists",
+        "not an issue",
+        "no drift detected",
+        "no drift.",
+        "does not trigger",
+        "doesn't trigger",
+        "do not emit",
+        "should not emit",
+        "should not be emitted",
+        "no error to report",
+      ];
+      for (const phrase of selfContradictingPhrases) {
+        if (explanation.includes(phrase)) {
+          return {
+            ok: false,
+            error:
+              `self_contradicting_explanation: agent_explanation contains "${phrase}" ` +
+              "which indicates the trigger check did NOT fire. Skip this " +
+              "issue and continue. Do not retry with the same payload.",
+          };
+        }
+      }
+
+      const issue = await createReconciliationIssue({
+        plan_id: input.plan_id,
+        payroll_run_id: input.payroll_run_id,
+        payroll_record_id: input.payroll_record_id ?? null,
+        ...input.issue,
+      });
+
+      await writeAuditLog({
+        actor_type: "agent",
+        actor_name: ctx.actor_name,
+        action: "ISSUE_CREATED",
+        entity_type: "reconciliation_issue",
+        entity_id: issue.id,
+        payroll_run_id: input.payroll_run_id ?? undefined,
+        employee_id: input.issue.employee_id ?? undefined,
+        field_name: input.issue.field_name ?? undefined,
+        before_value: {
+          code: input.issue.code,
+          severity: input.issue.severity,
+          category: input.issue.category,
+          expected_value: input.issue.expected_value ?? null,
+          actual_value: input.issue.actual_value ?? null,
+          related_issue_id: input.issue.related_issue_id ?? null,
+        },
+        after_value: { issue_id: issue.id },
+        reason: input.issue.description,
+        status: "open",
+      });
+
+      let fix_id: string | null = null;
+      if (input.suggested_fix) {
+        const fix = await createSuggestedFix({
+          issue_id: issue.id,
+          ...input.suggested_fix,
+        });
+        fix_id = fix.id;
+
+        await writeAuditLog({
+          actor_type: "agent",
+          actor_name: ctx.actor_name,
+          action: "FIX_SUGGESTED",
+          entity_type: "suggested_fix",
+          entity_id: fix.id,
+          payroll_run_id: input.payroll_run_id ?? undefined,
+          employee_id: input.issue.employee_id ?? undefined,
+          field_name: input.issue.field_name ?? undefined,
+          before_value: {
+            issue_id: issue.id,
+            kind: input.suggested_fix.proposed_changes.kind,
+            confidence: input.suggested_fix.confidence,
+          },
+          after_value: {
+            fix_id: fix.id,
+            proposed_changes: input.suggested_fix.proposed_changes,
+          },
+          reason: input.suggested_fix.description,
+          status: "pending",
+        });
+      }
+
+      return {
+        ok: true,
+        data: {
+          issue_id: issue.id,
+          fix_id,
+          severity: issue.severity,
+          code: issue.code,
+        },
+      };
+    } catch (err) {
+      if (err instanceof DataLayerError) {
+        return { ok: false, error: err.message };
+      }
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
+// flag_reconciliation_observation
+// ---------------------------------------------------------------------------
+
+/**
+ * Audit-only escape hatch for the reconciliation agent. Mirrors
+ * `flag_mapping_issue` / `flag_participant_issue` -- no row in
+ * `reconciliation_issues`, just a single `audit_logs` entry the
+ * human reviewer can scan. Use for non-actionable notes like
+ * "all 25 records validated clean" or "this is a re-run of Run 4".
+ */
+const flagReconciliationObservationInputSchema = z.object({
+  plan_id: z.string().uuid(),
+  payroll_run_id: z.string().uuid().nullable(),
+  observation_code: z.string().min(1).max(120),
+  severity: z.enum(["low", "medium", "high"]),
+  description: z.string().min(1).max(2000),
+  context: z.unknown().nullable().optional(),
+});
+
+type FlagReconciliationObservationInput = z.infer<
+  typeof flagReconciliationObservationInputSchema
+>;
+
+const flagReconciliationObservation: ToolDefinition<FlagReconciliationObservationInput> = {
+  name: "flag_reconciliation_observation",
+  description:
+    "Record a non-issue observation for the human reviewer (e.g., " +
+    "'all 25 records validated clean', 'noticed this is a re-run of " +
+    "Run 4'). Audit-log only; does NOT create a reconciliation_issues " +
+    "row. Use rarely -- prefer propose_reconciliation_issue when the " +
+    "observation is actionable.",
+  inputJsonSchema: {
+    type: "object",
+    properties: {
+      plan_id: {
+        type: "string",
+        description: "uuid of the plans row the observation is about.",
+      },
+      payroll_run_id: {
+        type: ["string", "null"],
+        description:
+          "uuid of the payroll_runs row, or null when the observation " +
+          "is plan-scoped rather than tied to a single run.",
+      },
+      observation_code: {
+        type: "string",
+        minLength: 1,
+        maxLength: 120,
+        description:
+          "Short SCREAMING_SNAKE code that names this observation, " +
+          "e.g. RUN_VALIDATED_CLEAN, RERUN_OF_PRIOR_RUN, NO_CENSUS_DRIFT.",
+      },
+      severity: {
+        type: "string",
+        enum: ["low", "medium", "high"],
+        description:
+          "Reviewer-facing triage hint. Most observations are 'low'; " +
+          "reserve 'high' for surprising findings that still don't " +
+          "warrant a reconciliation_issues row.",
+      },
+      description: {
+        type: "string",
+        minLength: 1,
+        maxLength: 2000,
+        description:
+          "One human-readable sentence explaining the observation. " +
+          "Becomes the audit-log reason.",
+      },
+      context: {
+        description:
+          "Optional arbitrary JSON sidecar for the observation (e.g. " +
+          "counts, ids of compared rows). Any JSON value, including " +
+          "null.",
+      },
+    },
+    required: [
+      "plan_id",
+      "payroll_run_id",
+      "observation_code",
+      "severity",
+      "description",
+    ],
+    additionalProperties: false,
+  },
+  inputSchema: flagReconciliationObservationInputSchema,
+  async handler(input, ctx) {
+    try {
+      const entity_type = input.payroll_run_id ? "payroll_run" : "plan";
+      const entity_id = input.payroll_run_id ?? input.plan_id;
+
+      const row = await writeAuditLog({
+        actor_type: "agent",
+        actor_name: ctx.actor_name,
+        action: "RECONCILIATION_OBSERVATION",
+        entity_type,
+        entity_id,
+        payroll_run_id: input.payroll_run_id ?? undefined,
+        before_value: {
+          observation_code: input.observation_code,
+          context: input.context ?? null,
+        },
+        reason: input.description,
+        status: input.severity,
+      });
+      return { ok: true, data: { audit_log_id: row.id } };
+    } catch (err) {
+      if (err instanceof DataLayerError) {
+        return { ok: false, error: err.message };
+      }
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -751,6 +1071,8 @@ const ALL_TOOLS = [
   flagParticipantIssue,
   proposePayrollMapping,
   flagMappingIssue,
+  proposeReconciliationIssue,
+  flagReconciliationObservation,
 ] as const;
 
 const TOOLS_BY_NAME: Record<string, ToolDefinition<unknown>> =

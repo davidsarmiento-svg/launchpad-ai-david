@@ -42,6 +42,11 @@ import {
   type ExtractedPlanFields,
   extractedPlanFieldUiHints,
 } from "@/lib/server/plan-extraction";
+import type {
+  ReconciliationIssueRow,
+  ReconciliationIssueSeverity,
+} from "@/lib/server/reconciliation-issues";
+import type { SuggestedFixRow } from "@/lib/server/suggested-fixes";
 
 /**
  * Plan detail screen.
@@ -202,15 +207,35 @@ type MapResponse =
     };
 
 /**
+ * Response payload for `POST /api/plans/[id]/payroll-runs/[run_id]/reconcile`.
+ *
+ * Mirrors `RunReconciliationResult` in
+ * `lib/server/reconciliation-runner.ts`. The route always returns
+ * this shape on 200 (success or partial-success); `final_status`
+ * tells the UI whether the run flipped to `'reconciled'` or stayed
+ * `'mapped'` (failed, re-runnable).
+ */
+type ReconcileResponse = {
+  run_id: string;
+  plan_id: string;
+  stop_reason: string | null;
+  iterations: number;
+  tool_calls: Array<{ name: string; ok: boolean }>;
+  issue_count: number;
+  final_status: "reconciled" | "mapped";
+};
+
+/**
  * One shared "latest agent run" timeline that updates whether the
- * operator just ran extraction, import, or mapping. The `kind` field
- * drives the card title so the operator always knows which run they're
- * looking at.
+ * operator just ran extraction, import, mapping, or reconciliation.
+ * The `kind` field drives the card title so the operator always
+ * knows which run they're looking at.
  */
 type LatestRun =
   | { kind: "extract"; data: ExtractResponse }
   | { kind: "import"; data: ImportResponse }
-  | { kind: "map"; data: MapResponse };
+  | { kind: "map"; data: MapResponse }
+  | { kind: "reconcile"; data: ReconcileResponse };
 
 const STATUS_VARIANT: Record<
   PlanDetailPlan["extraction_status"],
@@ -229,6 +254,8 @@ export function PlanDetailClient({
   payrollRuns,
   pendingMapping,
   approvedMapping,
+  issues,
+  fixesByIssueId,
 }: {
   plan: PlanDetailPlan;
   files: PlanDetailFile[];
@@ -236,6 +263,8 @@ export function PlanDetailClient({
   payrollRuns: PlanDetailPayrollRun[];
   pendingMapping: PlanDetailPayrollMapping | null;
   approvedMapping: PlanDetailPayrollMapping | null;
+  issues: ReconciliationIssueRow[];
+  fixesByIssueId: Record<string, SuggestedFixRow[]>;
 }) {
   const router = useRouter();
   // `running` holds the file_id or run_id whose agent run is currently
@@ -334,6 +363,38 @@ export function PlanDetailClient({
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Mapping failed");
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  async function handleReconcile(run_id: string) {
+    setRunning(run_id);
+    setLatest(null);
+    setError(null);
+    try {
+      const res = await fetch(
+        `/api/plans/${plan.id}/payroll-runs/${run_id}/reconcile`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        },
+      );
+      const body = (await res.json().catch(() => ({}))) as
+        | ReconcileResponse
+        | ExtractError;
+      if (!res.ok) {
+        setError(body as ExtractError);
+      } else {
+        setLatest({ kind: "reconcile", data: body as ReconcileResponse });
+        // Refresh so the runs table picks up the new reconciled status
+        // / issue_count and the ReconciliationIssuesCard re-renders with
+        // the freshly-filed issues + suggested fixes.
+        router.refresh();
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Reconciliation failed");
     } finally {
       setRunning(null);
     }
@@ -477,6 +538,14 @@ export function PlanDetailClient({
         approvedMapping={approvedMapping}
         running={running}
         onMap={handleMap}
+        onReconcile={handleReconcile}
+      />
+
+      <ReconciliationIssuesCard
+        plan={plan}
+        issues={issues}
+        fixesByIssueId={fixesByIssueId}
+        payrollRuns={payrollRuns}
       />
 
       {approvedMapping && (
@@ -523,9 +592,18 @@ function LatestRunCard({ run }: { run: LatestRun }) {
     );
   }
 
+  // Reconcile carries a projected tool_calls shape (`{ name, ok }`)
+  // rather than the full AgentToolCall records the other arms ship,
+  // so render it in a dedicated branch that knows the narrow shape.
+  // Splitting the render here keeps the shared timeline below honest
+  // about the AgentToolCall fields it relies on.
+  if (run.kind === "reconcile") {
+    return <ReconcileRunCard data={run.data} />;
+  }
+
   // Pull the agent-timeline fields off the narrowed union. The auto-
-  // applied map arm was handled above, so map(false), extract, and
-  // import all carry stop_reason/iterations/tool_calls.
+  // applied map arm and reconcile were handled above, so map(false),
+  // extract, and import all carry full AgentToolCall records here.
   const { title, stop_reason, iterations, tool_calls, extraSummary } =
     runTimelineFields(run);
 
@@ -579,16 +657,104 @@ function LatestRunCard({ run }: { run: LatestRun }) {
 }
 
 /**
- * Centralizes the "card chrome" projection for the three agent-timeline
- * arms (extract, import, map-non-auto-applied). Each arm contributes a
- * card title, an optional summary fragment, and its tool-call list.
+ * Dedicated render for a reconciliation agent run. Diverges from the
+ * shared LatestRunCard body for three reasons:
  *
- * The auto_applied map arm is intentionally rejected at runtime: the
- * caller handles it with an early-return render and shouldn't reach
- * this helper. Throwing surfaces the contract violation immediately
- * rather than silently producing "0 tool calls" UI.
+ *   1. tool_calls is a narrow `{ name, ok }` projection (full
+ *      inputs / iteration counts live in audit_logs server-side),
+ *      so the expandable per-call <details> blocks the other arms
+ *      use wouldn't have anything to expand.
+ *   2. Terminal status is mixed -- 'reconciled' vs 'mapped' (failed
+ *      but re-runnable) -- so the card surfaces that with a colored
+ *      badge instead of leaving it implicit in stop_reason.
+ *   3. issue_count is the primary outcome operators care about, so
+ *      it goes above the per-tool counters in the description.
  */
-function runTimelineFields(run: LatestRun): {
+function ReconcileRunCard({ data }: { data: ReconcileResponse }) {
+  let proposeOk = 0;
+  let flagOk = 0;
+  for (const c of data.tool_calls) {
+    if (!c.ok) continue;
+    if (c.name === "propose_reconciliation_issue") proposeOk += 1;
+    else if (c.name === "flag_reconciliation_observation") flagOk += 1;
+  }
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Latest reconciliation run</CardTitle>
+        <CardDescription>
+          stop_reason:{" "}
+          <span className="font-mono">{data.stop_reason ?? "—"}</span>
+          {" · "}iterations:{" "}
+          <span className="font-mono">{data.iterations}</span>
+          {" · "}
+          {data.tool_calls.length} tool call
+          {data.tool_calls.length === 1 ? "" : "s"}
+          {` · propose_reconciliation_issue ok: ${proposeOk}`}
+          {` · flag_reconciliation_observation ok: ${flagOk}`}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        <div className="flex flex-wrap items-center gap-3 text-sm">
+          <Badge
+            className={
+              data.final_status === "reconciled"
+                ? "bg-emerald-600 text-white"
+                : "bg-amber-500/20 text-amber-700 dark:bg-amber-500/30 dark:text-amber-300"
+            }
+          >
+            {data.final_status}
+          </Badge>
+          <span>
+            Detected{" "}
+            <span className="font-mono font-semibold">
+              {data.issue_count}
+            </span>{" "}
+            issue{data.issue_count === 1 ? "" : "s"}
+          </span>
+        </div>
+        {data.tool_calls.length === 0 ? (
+          <p className="text-xs text-muted-foreground">
+            No tool calls — agent ended its turn without filing any
+            issues or observations.
+          </p>
+        ) : (
+          <ul className="flex flex-col gap-1 text-xs">
+            {data.tool_calls.map((c, idx) => (
+              <li
+                key={`${c.name}:${idx}`}
+                className="flex items-center gap-2 rounded-md border border-foreground/10 bg-muted/30 px-3 py-1.5"
+              >
+                <Badge variant={c.ok ? "default" : "destructive"}>
+                  {c.ok ? "ok" : "error"}
+                </Badge>
+                <span className="font-mono">{c.name}</span>
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+/**
+ * Centralizes the "card chrome" projection for the three agent-timeline
+ * arms that share the AgentToolCall shape: extract, import, and
+ * map-non-auto-applied. Each arm contributes a card title, an optional
+ * summary fragment, and its tool-call list.
+ *
+ * Two callers handle their own rendering and never reach this helper:
+ *   - The auto_applied map arm has no tool_calls at all.
+ *   - The reconcile arm carries a narrower `{ name, ok }` projection
+ *     and renders via `ReconcileRunCard`.
+ *
+ * Both are rejected at runtime as a defensive guard; the type
+ * narrowing in the caller already excludes them.
+ */
+function runTimelineFields(
+  run: Exclude<LatestRun, { kind: "reconcile" }>,
+): {
   title: string;
   stop_reason: string | null;
   iterations: number;
@@ -1140,6 +1306,7 @@ function PayrollRunsTable({
   approvedMapping,
   running,
   onMap,
+  onReconcile,
 }: {
   plan: PlanDetailPlan;
   files: PlanDetailFile[];
@@ -1148,6 +1315,7 @@ function PayrollRunsTable({
   approvedMapping: PlanDetailPayrollMapping | null;
   running: string | null;
   onMap: (run_id: string) => void;
+  onReconcile: (run_id: string) => void;
 }) {
   // Drop the unused `plan` param onto a void expression so the lint
   // rule for unused args doesn't fire while keeping the prop in the
@@ -1164,7 +1332,10 @@ function PayrollRunsTable({
           <span className="font-mono">Map run</span> on an{" "}
           <span className="font-mono">uploaded</span> run to invoke the
           Payroll Mapping Agent (or auto-apply a previously-approved
-          mapping when its columns cover this CSV).
+          mapping when its columns cover this CSV), then{" "}
+          <span className="font-mono">Reconcile</span> on a{" "}
+          <span className="font-mono">mapped</span> run to invoke the
+          Payroll Reconciliation Agent.
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -1198,6 +1369,7 @@ function PayrollRunsTable({
                       : null);
                 const isThisRunning = running === run.id;
                 const canMap = run.status === "uploaded";
+                const canReconcile = run.status === "mapped";
                 return (
                   <TableRow key={run.id}>
                     <TableCell className="font-mono">{filename}</TableCell>
@@ -1226,6 +1398,15 @@ function PayrollRunsTable({
                           disabled={running !== null}
                         >
                           {isThisRunning ? "Mapping…" : "Map run"}
+                        </Button>
+                      ) : canReconcile ? (
+                        <Button
+                          type="button"
+                          size="sm"
+                          onClick={() => onReconcile(run.id)}
+                          disabled={running !== null}
+                        >
+                          {isThisRunning ? "Reconciling…" : "Reconcile"}
                         </Button>
                       ) : (
                         <span className="text-xs text-muted-foreground">
@@ -1693,5 +1874,603 @@ function ApprovedMappingCard({
         </details>
       </CardContent>
     </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Reconciliation issues card (per-plan, grouped by payroll run).
+// ---------------------------------------------------------------------------
+
+/**
+ * Demo-flow human identity. Mirrors the `system_demo_user` /
+ * `system_demo_user` defaults used by the extraction and mapping
+ * approval cards above so audit log entries from the same operator
+ * session are correlatable on actor_name.
+ */
+const RECONCILIATION_ACTOR = "system_demo_user";
+
+/**
+ * Sort ordinal so issues within a group surface the highest-severity
+ * problems first. Matches the agent's own "high > medium > low"
+ * triage from the skill.
+ */
+const SEVERITY_RANK: Record<ReconciliationIssueSeverity, number> = {
+  high: 0,
+  medium: 1,
+  low: 2,
+};
+
+/**
+ * Color choices for the severity badge. The destructive variant for
+ * 'high' already maps onto the destructive palette; medium uses an
+ * inline amber utility because the shadcn Badge variants don't
+ * include a "warning" today and adding one would touch every other
+ * card. Low falls back to secondary -- the visual hierarchy reads
+ * "scary > warning > muted" left-to-right at a glance.
+ */
+function severityBadgeProps(severity: ReconciliationIssueSeverity): {
+  variant: "destructive" | "secondary";
+  className?: string;
+} {
+  if (severity === "high") return { variant: "destructive" };
+  if (severity === "medium") {
+    return {
+      variant: "secondary",
+      className:
+        "bg-amber-500/20 text-amber-700 dark:bg-amber-500/30 dark:text-amber-300",
+    };
+  }
+  return { variant: "secondary" };
+}
+
+const ISSUE_STATUS_VARIANT: Record<
+  ReconciliationIssueRow["status"],
+  "secondary" | "default" | "outline"
+> = {
+  open: "outline",
+  resolved: "default",
+  ignored: "secondary",
+};
+
+/**
+ * Render an issue's expected_value / actual_value cell. Primitives
+ * (string, number, boolean) and `null` print verbatim; objects and
+ * arrays go through `JSON.stringify` so a complex diff doesn't get
+ * collapsed to `[object Object]`.
+ */
+function renderIssueValue(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "boolean"
+  ) {
+    return String(value);
+  }
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+/**
+ * Group key for an issue. `null` payroll_run_id becomes the sentinel
+ * `"__plan__"` so Map/Record lookups can use a string key uniformly;
+ * the rendering layer translates back to "Plan-scoped issues".
+ */
+const PLAN_SCOPED_KEY = "__plan__";
+
+type IssueGroup = {
+  key: string;
+  /** null when the group is plan-scoped (no anchoring run). */
+  run: PlanDetailPayrollRun | null;
+  issues: ReconciliationIssueRow[];
+};
+
+/**
+ * Build the per-run groupings the card renders. Sort within each
+ * group by severity (high first) then created_at desc. Sort groups
+ * themselves by run.uploaded_at desc with the plan-scoped bucket
+ * pinned last (it carries no temporal anchor).
+ */
+function buildIssueGroups(
+  issues: ReconciliationIssueRow[],
+  payrollRuns: PlanDetailPayrollRun[],
+): IssueGroup[] {
+  const byKey = new Map<string, ReconciliationIssueRow[]>();
+  for (const issue of issues) {
+    const key = issue.payroll_run_id ?? PLAN_SCOPED_KEY;
+    const bucket = byKey.get(key);
+    if (bucket) bucket.push(issue);
+    else byKey.set(key, [issue]);
+  }
+
+  const runById = new Map(payrollRuns.map((r) => [r.id, r]));
+
+  const groups: IssueGroup[] = [];
+  for (const [key, bucketIssues] of byKey) {
+    const run = key === PLAN_SCOPED_KEY ? null : (runById.get(key) ?? null);
+    bucketIssues.sort((a, b) => {
+      const sev = SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity];
+      if (sev !== 0) return sev;
+      // Newer-first within the same severity tier.
+      return b.created_at.localeCompare(a.created_at);
+    });
+    groups.push({ key, run, issues: bucketIssues });
+  }
+
+  groups.sort((a, b) => {
+    if (a.run === null) return 1;
+    if (b.run === null) return -1;
+    return b.run.uploaded_at.localeCompare(a.run.uploaded_at);
+  });
+
+  return groups;
+}
+
+function ReconciliationIssuesCard({
+  plan,
+  issues,
+  fixesByIssueId,
+  payrollRuns,
+}: {
+  plan: PlanDetailPlan;
+  issues: ReconciliationIssueRow[];
+  fixesByIssueId: Record<string, SuggestedFixRow[]>;
+  payrollRuns: PlanDetailPayrollRun[];
+}) {
+  // Hide the card entirely when there's nothing to triage. An empty
+  // section between PayrollRunsTable and ApprovedMappingCard would
+  // be visual noise; the operator doesn't need to see "0 issues"
+  // confirmed every load.
+  if (issues.length === 0) return null;
+
+  const groups = buildIssueGroups(issues, payrollRuns);
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Reconciliation issues</CardTitle>
+        <CardDescription>
+          Issues filed by the Payroll Reconciliation Agent across this
+          plan&apos;s runs. Approve a suggested fix to apply it
+          mechanically, reject to discard it, or mark an issue
+          resolved / ignored if no fix applies.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-6">
+        {groups.map((group) => (
+          <IssueGroupSection
+            key={group.key}
+            plan={plan}
+            group={group}
+            fixesByIssueId={fixesByIssueId}
+          />
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
+function IssueGroupSection({
+  plan,
+  group,
+  fixesByIssueId,
+}: {
+  plan: PlanDetailPlan;
+  group: IssueGroup;
+  fixesByIssueId: Record<string, SuggestedFixRow[]>;
+}) {
+  const heading =
+    group.run === null
+      ? "Plan-scoped issues"
+      : group.run.pay_date
+        ? `Pay date ${group.run.pay_date}`
+        : `Run ${group.run.id.slice(0, 8)}…`;
+
+  return (
+    <section className="flex flex-col gap-3">
+      <header className="flex flex-wrap items-center gap-2 text-sm">
+        <h3 className="font-semibold">{heading}</h3>
+        {group.run && (
+          <Badge variant={RUN_STATUS_VARIANT[group.run.status]}>
+            {group.run.status}
+          </Badge>
+        )}
+        <span className="text-xs text-muted-foreground">
+          {group.issues.length} issue
+          {group.issues.length === 1 ? "" : "s"}
+        </span>
+      </header>
+      <div className="flex flex-col gap-3">
+        {group.issues.map((issue) => (
+          <IssueCard
+            key={issue.id}
+            plan={plan}
+            issue={issue}
+            fixes={fixesByIssueId[issue.id] ?? []}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+type IssueDialogAction =
+  | { kind: "reject_fix"; fix: SuggestedFixRow }
+  | { kind: "resolve_issue" }
+  | { kind: "ignore_issue" };
+
+function IssueCard({
+  plan,
+  issue,
+  fixes,
+}: {
+  plan: PlanDetailPlan;
+  issue: ReconciliationIssueRow;
+  fixes: SuggestedFixRow[];
+}) {
+  const router = useRouter();
+  const [submitting, setSubmitting] = useState<
+    "approve" | "reject" | "resolve" | "ignore" | null
+  >(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [dialog, setDialog] = useState<IssueDialogAction | null>(null);
+  const [dialogReason, setDialogReason] = useState("");
+
+  // The first pending fix is the one the agent currently wants
+  // applied; subsequent rows in `fixes` would be historical (failed
+  // / rejected) and aren't actionable here.
+  const pendingFix = fixes.find((f) => f.status === "pending") ?? null;
+  const severityProps = severityBadgeProps(issue.severity);
+
+  function openDialog(action: IssueDialogAction) {
+    setDialog(action);
+    setDialogReason("");
+    setErrorMsg(null);
+  }
+
+  function closeDialog() {
+    if (submitting !== null) return;
+    setDialog(null);
+    setDialogReason("");
+  }
+
+  async function handleApproveFix(fix: SuggestedFixRow) {
+    setSubmitting("approve");
+    setErrorMsg(null);
+    try {
+      const res = await fetch(
+        `/api/plans/${plan.id}/suggested-fixes/${fix.id}`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            approver_name: RECONCILIATION_ACTOR,
+            reason: "Approved via UI",
+          }),
+        },
+      );
+      const body = (await res.json().catch(() => ({}))) as {
+        applied?: boolean;
+        error?: string;
+        message?: string;
+      };
+      if (!res.ok) {
+        throw new Error(body.message ?? body.error ?? `PATCH ${res.status}`);
+      }
+      // Approve succeeded; surface apply-side failure separately so
+      // the operator knows the row decision landed even when the
+      // mechanical apply tripped optimistic concurrency.
+      if (body.applied === false) {
+        setErrorMsg(
+          `Approval recorded but apply failed: ${body.error ?? "unknown"}`,
+        );
+      }
+      router.refresh();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Approval failed");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleRejectFix(fix: SuggestedFixRow, reason: string) {
+    setSubmitting("reject");
+    setErrorMsg(null);
+    try {
+      const res = await fetch(
+        `/api/plans/${plan.id}/suggested-fixes/${fix.id}/reject`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            reviewer_name: RECONCILIATION_ACTOR,
+            reason,
+          }),
+        },
+      );
+      const body = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        message?: string;
+      };
+      if (!res.ok) {
+        throw new Error(body.message ?? body.error ?? `POST ${res.status}`);
+      }
+      setDialog(null);
+      setDialogReason("");
+      router.refresh();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Rejection failed");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleUpdateIssueStatus(
+    status: "resolved" | "ignored",
+    reason: string,
+  ) {
+    setSubmitting(status === "resolved" ? "resolve" : "ignore");
+    setErrorMsg(null);
+    try {
+      const res = await fetch(
+        `/api/plans/${plan.id}/reconciliation-issues/${issue.id}`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            status,
+            resolved_by: RECONCILIATION_ACTOR,
+            reason,
+          }),
+        },
+      );
+      const body = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        message?: string;
+      };
+      if (!res.ok) {
+        throw new Error(body.message ?? body.error ?? `PATCH ${res.status}`);
+      }
+      setDialog(null);
+      setDialogReason("");
+      router.refresh();
+    } catch (err) {
+      setErrorMsg(
+        err instanceof Error
+          ? err.message
+          : status === "resolved"
+            ? "Mark-resolved failed"
+            : "Ignore failed",
+      );
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  return (
+    <article className="flex flex-col gap-2 rounded-md border border-foreground/10 bg-muted/30 p-3">
+      <div className="flex flex-wrap items-center gap-2 text-xs">
+        <Badge
+          variant={severityProps.variant}
+          className={severityProps.className}
+        >
+          {issue.severity}
+        </Badge>
+        <Badge variant="outline" className="font-mono">
+          {issue.category}
+        </Badge>
+        <Badge variant="outline" className="font-mono">
+          {issue.code}
+        </Badge>
+        <Badge variant={ISSUE_STATUS_VARIANT[issue.status]}>
+          {issue.status}
+        </Badge>
+      </div>
+
+      <p className="text-sm font-semibold">{issue.description}</p>
+
+      {issue.agent_explanation && (
+        <p className="text-xs italic text-muted-foreground">
+          {issue.agent_explanation}
+        </p>
+      )}
+
+      {(issue.field_name !== null ||
+        issue.expected_value !== null ||
+        issue.actual_value !== null) && (
+        <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 text-xs">
+          {issue.field_name !== null && (
+            <>
+              <dt className="text-muted-foreground">field</dt>
+              <dd className="font-mono">{issue.field_name}</dd>
+            </>
+          )}
+          {issue.expected_value !== null && (
+            <>
+              <dt className="text-muted-foreground">expected</dt>
+              <dd className="font-mono break-all">
+                {renderIssueValue(issue.expected_value)}
+              </dd>
+            </>
+          )}
+          {issue.actual_value !== null && (
+            <>
+              <dt className="text-muted-foreground">actual</dt>
+              <dd className="font-mono break-all">
+                {renderIssueValue(issue.actual_value)}
+              </dd>
+            </>
+          )}
+        </dl>
+      )}
+
+      {issue.status !== "open" ? (
+        <p className="text-xs text-muted-foreground">
+          {issue.status === "resolved" ? "Resolved" : "Ignored"}
+          {issue.resolved_by ? (
+            <>
+              {" by "}
+              <span className="font-mono">{issue.resolved_by}</span>
+            </>
+          ) : null}
+          {issue.resolved_at ? (
+            <>
+              {" at "}
+              <span className="font-mono">
+                {new Date(issue.resolved_at).toLocaleString()}
+              </span>
+            </>
+          ) : null}
+          .
+        </p>
+      ) : pendingFix ? (
+        <div className="flex flex-col gap-2 rounded-md border border-foreground/10 bg-background/60 p-2">
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <Badge variant="outline" className="font-mono">
+              {pendingFix.proposed_changes.kind}
+            </Badge>
+            <span className="text-muted-foreground">
+              confidence{" "}
+              <span className="font-mono">
+                {Number(pendingFix.confidence).toFixed(2)}
+              </span>
+            </span>
+          </div>
+          <p className="text-xs">{pendingFix.description}</p>
+          {pendingFix.agent_reasoning && (
+            <p className="text-xs italic text-muted-foreground">
+              {pendingFix.agent_reasoning}
+            </p>
+          )}
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              onClick={() => openDialog({ kind: "reject_fix", fix: pendingFix })}
+              disabled={submitting !== null}
+            >
+              Reject
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              onClick={() => handleApproveFix(pendingFix)}
+              disabled={submitting !== null}
+            >
+              {submitting === "approve" ? "Approving…" : "Approve"}
+            </Button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex justify-end gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => openDialog({ kind: "ignore_issue" })}
+            disabled={submitting !== null}
+          >
+            Ignore
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            onClick={() => openDialog({ kind: "resolve_issue" })}
+            disabled={submitting !== null}
+          >
+            Mark resolved
+          </Button>
+        </div>
+      )}
+
+      {errorMsg && (
+        <p className="text-xs text-red-600 dark:text-red-400">{errorMsg}</p>
+      )}
+
+      <Dialog
+        open={dialog !== null}
+        onOpenChange={(open) => {
+          if (!open) closeDialog();
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>
+              {dialog?.kind === "reject_fix"
+                ? "Reject suggested fix"
+                : dialog?.kind === "resolve_issue"
+                  ? "Mark issue resolved"
+                  : "Ignore issue"}
+            </DialogTitle>
+            <DialogDescription>
+              {dialog?.kind === "reject_fix"
+                ? "The fix will be moved to status=rejected. The underlying issue stays open so a human can suggest a different fix or mark it resolved manually."
+                : dialog?.kind === "resolve_issue"
+                  ? "The issue will be flipped to status=resolved with no mechanical apply. Use this when the underlying data is already correct or was fixed by hand."
+                  : "The issue will be flipped to status=ignored. Use this when the agent flagged something outside the scope of reconciliation."}
+            </DialogDescription>
+          </DialogHeader>
+          <textarea
+            className="min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            placeholder="Reason (required, ≤ 2000 chars)."
+            maxLength={2000}
+            value={dialogReason}
+            onChange={(e) => setDialogReason(e.target.value)}
+          />
+          {errorMsg && (
+            <p className="text-xs text-red-600 dark:text-red-400">
+              {errorMsg}
+            </p>
+          )}
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={closeDialog}
+              disabled={submitting !== null}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant={
+                dialog?.kind === "reject_fix" ? "destructive" : "default"
+              }
+              onClick={() => {
+                if (!dialog) return;
+                const reason = dialogReason.trim();
+                if (reason.length === 0) return;
+                if (dialog.kind === "reject_fix") {
+                  void handleRejectFix(dialog.fix, reason);
+                } else if (dialog.kind === "resolve_issue") {
+                  void handleUpdateIssueStatus("resolved", reason);
+                } else {
+                  void handleUpdateIssueStatus("ignored", reason);
+                }
+              }}
+              disabled={
+                submitting !== null || dialogReason.trim().length === 0
+              }
+            >
+              {submitting === "reject"
+                ? "Rejecting…"
+                : submitting === "resolve"
+                  ? "Resolving…"
+                  : submitting === "ignore"
+                    ? "Ignoring…"
+                    : dialog?.kind === "reject_fix"
+                      ? "Confirm reject"
+                      : dialog?.kind === "resolve_issue"
+                        ? "Confirm resolved"
+                        : "Confirm ignore"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </article>
   );
 }

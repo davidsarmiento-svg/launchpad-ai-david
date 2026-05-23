@@ -331,6 +331,8 @@ export async function applyMappingToRun(
     validation_status: "pending" as const,
     validation_errors: [] as unknown[],
   }));
+  const inferredPayDate =
+    prev.pay_date ?? rows.find((row) => row.pay_date)?.pay_date ?? null;
 
   const supabase = getSupabaseServiceRoleClient();
   const { error: upsertError } = await supabase
@@ -352,6 +354,7 @@ export async function applyMappingToRun(
     .update({
       status: "mapped",
       mapping_id: parsed.mapping_id,
+      pay_date: inferredPayDate,
       row_count: rows.length,
       mapped_at: new Date().toISOString(),
     })
@@ -377,4 +380,33 @@ export async function applyMappingToRun(
   }
 
   return { run: data as PayrollRunRow, record_count: rows.length };
+}
+
+/**
+ * List every payroll_records row for one run, ordered by row_number.
+ * Used by the reconciliation runner to build the agent context.
+ * Returns [] when the run has no records (e.g., not mapped yet).
+ */
+export async function listPayrollRecordsForRun(
+  payroll_run_id: string,
+): Promise<PayrollRecordRow[]> {
+  uuid.parse(payroll_run_id);
+
+  const supabase = getSupabaseServiceRoleClient();
+  const { data, error } = await supabase
+    .from("payroll_records")
+    .select("*")
+    .eq("payroll_run_id", payroll_run_id)
+    .order("row_number", { ascending: true });
+
+  if (error) {
+    throw new DataLayerError({
+      module: "payroll-runs",
+      operation: "listPayrollRecordsForRun",
+      message: error.message,
+      cause: error,
+    });
+  }
+
+  return (data ?? []) as PayrollRecordRow[];
 }

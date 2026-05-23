@@ -1,7 +1,8 @@
 import { notFound } from "next/navigation";
 
-import { PlanDashboardShell } from "@/components/plan-dashboard/plan-dashboard-shell";
+import { AppShell } from "@/components/dashboard/app-shell";
 import { loadPlanDashboard } from "@/lib/server/load-plan-dashboard";
+import { listPlanOnboardingSummaries } from "@/lib/server/plan-onboarding-summaries";
 
 export const dynamic = "force-dynamic";
 
@@ -13,12 +14,17 @@ export default async function PlanDashboardLayout({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
-  const data = await loadPlanDashboard(id);
+
+  const [plans, data] = await Promise.all([
+    listPlanOnboardingSummaries(50),
+    loadPlanDashboard(id),
+  ]);
+
   if (!data) notFound();
 
   return (
-    <PlanDashboardShell planId={id} data={data}>
+    <AppShell plans={plans} planData={data}>
       {children}
-    </PlanDashboardShell>
+    </AppShell>
   );
 }

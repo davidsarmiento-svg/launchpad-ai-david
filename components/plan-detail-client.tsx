@@ -31,6 +31,14 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import {
+  CANONICAL_PAYROLL_FIELDS,
+  type CanonicalPayrollField,
+  fromStorageMapping,
+  type PayrollMappingProposal,
+  payrollMappingFieldUiHints,
+  type PayrollStorageMapping,
+} from "@/lib/server/payroll-mapping";
+import {
   type ExtractedPlanFields,
   extractedPlanFieldUiHints,
 } from "@/lib/server/plan-extraction";
@@ -94,6 +102,42 @@ export type PlanDetailParticipant = {
   employment_status: string | null;
 };
 
+/**
+ * Narrowing of `PayrollRunRow` from `lib/server/payroll-runs.ts`. We
+ * mirror only the fields the client renders so the server module
+ * (which uses `server-only`) is never pulled into the client bundle
+ * via a transitive type re-export.
+ */
+export type PlanDetailPayrollRun = {
+  id: string;
+  plan_id: string;
+  source_file_id: string | null;
+  mapping_id: string | null;
+  label: string | null;
+  pay_date: string | null;
+  status: "uploaded" | "mapped" | "validated" | "reconciled" | "failed";
+  row_count: number;
+  uploaded_at: string;
+  mapped_at: string | null;
+};
+
+/**
+ * Narrowing of `PayrollMappingRow` from `lib/server/payroll-mappings.ts`.
+ * `mapping` is the CSV-keyed storage shape; the mapping card converts
+ * it to canonical-keyed proposal form for the editable inputs.
+ */
+export type PlanDetailPayrollMapping = {
+  id: string;
+  plan_id: string;
+  name: string;
+  mapping: PayrollStorageMapping;
+  suggested_by: string | null;
+  suggested_at: string;
+  approved_by: string | null;
+  approved_at: string | null;
+  status: "pending" | "approved" | "superseded" | "rejected";
+};
+
 type AgentToolCall = {
   iteration: number;
   tool_use_id: string;
@@ -128,13 +172,45 @@ type ImportResponse = {
 };
 
 /**
+ * Response payload for `POST /api/plans/[id]/payroll-runs/[run_id]/map`.
+ *
+ * Two arms:
+ *   - `auto_applied: true` — the route found an existing approved
+ *     mapping whose columns cover this CSV header and applied it
+ *     directly. No agent invocation, no pending mapping to review.
+ *   - `auto_applied: false` — the Payroll Mapping Agent ran, emitted
+ *     a new pending mapping (`mapping_id`), and surfaced its tool-call
+ *     timeline for the operator to inspect before approving.
+ */
+type MapResponse =
+  | {
+      run_id: string;
+      plan_id: string;
+      auto_applied: true;
+      mapping_id: string;
+      mapping_name: string;
+      record_count: number;
+    }
+  | {
+      run_id: string;
+      plan_id: string;
+      auto_applied: false;
+      mapping_id: string;
+      stop_reason: string | null;
+      iterations: number;
+      tool_calls: Array<AgentToolCall>;
+    };
+
+/**
  * One shared "latest agent run" timeline that updates whether the
- * operator just ran extraction or import. The `kind` field drives the
- * card title so the operator always knows which run they're looking at.
+ * operator just ran extraction, import, or mapping. The `kind` field
+ * drives the card title so the operator always knows which run they're
+ * looking at.
  */
 type LatestRun =
   | { kind: "extract"; data: ExtractResponse }
-  | { kind: "import"; data: ImportResponse };
+  | { kind: "import"; data: ImportResponse }
+  | { kind: "map"; data: MapResponse };
 
 const STATUS_VARIANT: Record<
   PlanDetailPlan["extraction_status"],
@@ -150,15 +226,23 @@ export function PlanDetailClient({
   plan,
   files,
   participants,
+  payrollRuns,
+  pendingMapping,
+  approvedMapping,
 }: {
   plan: PlanDetailPlan;
   files: PlanDetailFile[];
   participants: PlanDetailParticipant[];
+  payrollRuns: PlanDetailPayrollRun[];
+  pendingMapping: PlanDetailPayrollMapping | null;
+  approvedMapping: PlanDetailPayrollMapping | null;
 }) {
   const router = useRouter();
-  // `running` holds the file_id whose agent run is currently in flight,
-  // shared across both Run extraction and Run import buttons so we can
-  // disable every other button while one is working.
+  // `running` holds the file_id or run_id whose agent run is currently
+  // in flight, shared across Run extraction, Run import, and Map run
+  // buttons so we can disable every other button while one is working.
+  // file_ids and run_ids are both uuids drawn from disjoint tables, so
+  // a single string is unambiguous.
   const [running, setRunning] = useState<string | null>(null);
   const [latest, setLatest] = useState<LatestRun | null>(null);
   const [error, setError] = useState<ExtractError | string | null>(null);
@@ -218,6 +302,38 @@ export function PlanDetailClient({
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Import failed");
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  async function handleMap(run_id: string) {
+    setRunning(run_id);
+    setLatest(null);
+    setError(null);
+    try {
+      const res = await fetch(
+        `/api/plans/${plan.id}/payroll-runs/${run_id}/map`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({}),
+        },
+      );
+      const body = (await res.json().catch(() => ({}))) as
+        | MapResponse
+        | ExtractError;
+      if (!res.ok) {
+        setError(body as ExtractError);
+      } else {
+        setLatest({ kind: "map", data: body as MapResponse });
+        // Refresh so the runs table picks up the new status / mapping_id
+        // and the pending-mapping card appears (or disappears, in the
+        // auto-applied case).
+        router.refresh();
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Mapping failed");
     } finally {
       setRunning(null);
     }
@@ -338,6 +454,35 @@ export function PlanDetailClient({
         plan={plan}
       />
 
+      {pendingMapping && (
+        // Same re-mount-on-id trick as ExtractedFieldsCard: whenever the
+        // pending row's identity changes (new agent proposal landed, or
+        // the prior one was approved/rejected and a new one appeared),
+        // wipe form state so we never show stale CSV column values
+        // bound to a different mapping row.
+        <ProposedMappingCard
+          key={pendingMapping.id}
+          plan={plan}
+          files={files}
+          mapping={pendingMapping}
+          payrollRuns={payrollRuns}
+        />
+      )}
+
+      <PayrollRunsTable
+        plan={plan}
+        files={files}
+        payrollRuns={payrollRuns}
+        pendingMapping={pendingMapping}
+        approvedMapping={approvedMapping}
+        running={running}
+        onMap={handleMap}
+      />
+
+      {approvedMapping && (
+        <ApprovedMappingCard mapping={approvedMapping} />
+      )}
+
       <ParticipantsCard participants={participants} />
     </>
   );
@@ -348,14 +493,41 @@ export function PlanDetailClient({
 // ---------------------------------------------------------------------------
 
 function LatestRunCard({ run }: { run: LatestRun }) {
-  const title =
-    run.kind === "extract" ? "Latest extraction run" : "Latest import run";
-  const calls = run.data.tool_calls;
-  const extraSummary =
-    run.kind === "import"
-      ? ` · save_participants ok: ${run.data.save_calls}` +
-        ` · flag_participant_issue ok: ${run.data.flag_calls}`
-      : "";
+  // The auto-applied mapping path skips the agent entirely, so it
+  // has no tool_calls timeline. Render a single-row summary instead
+  // of the empty tool-call list the other arms would produce. Done as
+  // a typed-narrowing early return so the rest of this function can
+  // assume the agent-timeline fields are present.
+  if (run.kind === "map" && run.data.auto_applied) {
+    const { mapping_name, record_count } = run.data;
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle>Latest mapping run</CardTitle>
+          <CardDescription>
+            Auto-applied a previously-approved mapping; no agent
+            invocation was needed.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="flex items-center gap-2 text-sm">
+            <Badge variant="default">Auto-applied</Badge>
+            <span>
+              Auto-applied mapping{" "}
+              <span className="font-mono">{mapping_name}</span> (
+              {record_count} record{record_count === 1 ? "" : "s"} ingested)
+            </span>
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  // Pull the agent-timeline fields off the narrowed union. The auto-
+  // applied map arm was handled above, so map(false), extract, and
+  // import all carry stop_reason/iterations/tool_calls.
+  const { title, stop_reason, iterations, tool_calls, extraSummary } =
+    runTimelineFields(run);
 
   return (
     <Card>
@@ -363,16 +535,16 @@ function LatestRunCard({ run }: { run: LatestRun }) {
         <CardTitle>{title}</CardTitle>
         <CardDescription>
           stop_reason:{" "}
-          <span className="font-mono">{run.data.stop_reason ?? "—"}</span>
+          <span className="font-mono">{stop_reason ?? "—"}</span>
           {" · "}iterations:{" "}
-          <span className="font-mono">{run.data.iterations}</span>
+          <span className="font-mono">{iterations}</span>
           {" · "}
-          {calls.length} tool call{calls.length === 1 ? "" : "s"}
+          {tool_calls.length} tool call{tool_calls.length === 1 ? "" : "s"}
           {extraSummary}
         </CardDescription>
       </CardHeader>
       <CardContent className="flex flex-col gap-2">
-        {calls.map((c) => (
+        {tool_calls.map((c) => (
           <details
             key={c.tool_use_id}
             className="rounded-md border border-foreground/10 bg-muted/30 px-3 py-2 text-xs"
@@ -404,6 +576,71 @@ function LatestRunCard({ run }: { run: LatestRun }) {
       </CardContent>
     </Card>
   );
+}
+
+/**
+ * Centralizes the "card chrome" projection for the three agent-timeline
+ * arms (extract, import, map-non-auto-applied). Each arm contributes a
+ * card title, an optional summary fragment, and its tool-call list.
+ *
+ * The auto_applied map arm is intentionally rejected at runtime: the
+ * caller handles it with an early-return render and shouldn't reach
+ * this helper. Throwing surfaces the contract violation immediately
+ * rather than silently producing "0 tool calls" UI.
+ */
+function runTimelineFields(run: LatestRun): {
+  title: string;
+  stop_reason: string | null;
+  iterations: number;
+  tool_calls: AgentToolCall[];
+  extraSummary: string;
+} {
+  if (run.kind === "extract") {
+    return {
+      title: "Latest extraction run",
+      stop_reason: run.data.stop_reason,
+      iterations: run.data.iterations,
+      tool_calls: run.data.tool_calls,
+      extraSummary: "",
+    };
+  }
+  if (run.kind === "import") {
+    return {
+      title: "Latest import run",
+      stop_reason: run.data.stop_reason,
+      iterations: run.data.iterations,
+      tool_calls: run.data.tool_calls,
+      extraSummary:
+        ` · save_participants ok: ${run.data.save_calls}` +
+        ` · flag_participant_issue ok: ${run.data.flag_calls}`,
+    };
+  }
+  // run.kind === "map" — auto_applied:true was handled by the caller.
+  if (run.data.auto_applied) {
+    throw new Error(
+      "runTimelineFields invoked on auto-applied map arm; caller should early-return",
+    );
+  }
+  // Count ok results per tool name. flag_mapping_issue may legitimately
+  // never appear (clean mapping), but we still surface its 0 count so
+  // the operator can tell "agent ran and saw no issues" apart from
+  // "agent ran but didn't even consider issues".
+  let proposeOk = 0;
+  let flagOk = 0;
+  for (const c of run.data.tool_calls) {
+    if (!c.result.ok) continue;
+    if (c.name === "propose_payroll_mapping") proposeOk += 1;
+    else if (c.name === "flag_mapping_issue") flagOk += 1;
+  }
+  return {
+    title: "Latest mapping run",
+    stop_reason: run.data.stop_reason,
+    iterations: run.data.iterations,
+    tool_calls: run.data.tool_calls,
+    extraSummary:
+      ` · propose_payroll_mapping ok: ${proposeOk}` +
+      ` · flag_mapping_issue ok: ${flagOk}`,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -878,4 +1115,583 @@ function ReadOnlyValue({
     return <>{value === true ? "true" : "false"}</>;
   }
   return <>{String(value)}</>;
+}
+
+// ---------------------------------------------------------------------------
+// Payroll runs table.
+// ---------------------------------------------------------------------------
+
+const RUN_STATUS_VARIANT: Record<
+  PlanDetailPayrollRun["status"],
+  "secondary" | "default" | "destructive" | "outline"
+> = {
+  uploaded: "secondary",
+  mapped: "default",
+  validated: "default",
+  reconciled: "default",
+  failed: "destructive",
+};
+
+function PayrollRunsTable({
+  plan,
+  files,
+  payrollRuns,
+  pendingMapping,
+  approvedMapping,
+  running,
+  onMap,
+}: {
+  plan: PlanDetailPlan;
+  files: PlanDetailFile[];
+  payrollRuns: PlanDetailPayrollRun[];
+  pendingMapping: PlanDetailPayrollMapping | null;
+  approvedMapping: PlanDetailPayrollMapping | null;
+  running: string | null;
+  onMap: (run_id: string) => void;
+}) {
+  // Drop the unused `plan` param onto a void expression so the lint
+  // rule for unused args doesn't fire while keeping the prop in the
+  // signature -- callers pass it for future status badges keyed on
+  // the plan's own state.
+  void plan;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Payroll runs</CardTitle>
+        <CardDescription>
+          One row per uploaded payroll CSV. Click{" "}
+          <span className="font-mono">Map run</span> on an{" "}
+          <span className="font-mono">uploaded</span> run to invoke the
+          Payroll Mapping Agent (or auto-apply a previously-approved
+          mapping when its columns cover this CSV).
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        {payrollRuns.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No payroll runs yet. Upload a CSV with{" "}
+            <span className="font-mono">kind=payroll_run</span>.
+          </p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Filename</TableHead>
+                <TableHead>Uploaded</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead>Mapping</TableHead>
+                <TableHead className="text-right">Records</TableHead>
+                <TableHead className="text-right">Action</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {payrollRuns.map((run) => {
+                const file = files.find((f) => f.id === run.source_file_id);
+                const filename = file?.filename ?? "—";
+                const mappingName =
+                  run.mapping_id &&
+                  (run.mapping_id === approvedMapping?.id
+                    ? approvedMapping.name
+                    : run.mapping_id === pendingMapping?.id
+                      ? pendingMapping.name
+                      : null);
+                const isThisRunning = running === run.id;
+                const canMap = run.status === "uploaded";
+                return (
+                  <TableRow key={run.id}>
+                    <TableCell className="font-mono">{filename}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {new Date(run.uploaded_at).toLocaleDateString()}
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant={RUN_STATUS_VARIANT[run.status]}>
+                        {run.status}
+                      </Badge>
+                    </TableCell>
+                    <TableCell className="font-mono">
+                      {mappingName ?? (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-right font-mono">
+                      {run.row_count}
+                    </TableCell>
+                    <TableCell className="text-right">
+                      {canMap ? (
+                        <Button
+                          type="button"
+                          size="sm"
+                          onClick={() => onMap(run.id)}
+                          disabled={running !== null}
+                        >
+                          {isThisRunning ? "Mapping…" : "Map run"}
+                        </Button>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">
+                          —
+                        </span>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Proposed (pending) payroll mapping card.
+// ---------------------------------------------------------------------------
+
+type ProposalFormField = { value: string; absent: boolean };
+type ProposalFormState = Record<CanonicalPayrollField, ProposalFormField>;
+
+/**
+ * Convert a canonical-keyed proposal into editable form state. A
+ * `null` value (agent / human decided no CSV column maps) shows as
+ * `absent: true` with an empty input that disables on render.
+ */
+function proposalToFormState(
+  proposal: PayrollMappingProposal,
+): ProposalFormState {
+  const out = {} as ProposalFormState;
+  for (const field of CANONICAL_PAYROLL_FIELDS) {
+    const v = proposal[field];
+    out[field] = v === null
+      ? { value: "", absent: true }
+      : { value: v, absent: false };
+  }
+  return out;
+}
+
+/**
+ * Inverse of `proposalToFormState`. Throws if any non-absent field
+ * has a blank value -- callers should call `validateFormState` first
+ * to surface that as a user-facing error rather than catching here.
+ */
+function formStateToProposal(
+  state: ProposalFormState,
+): PayrollMappingProposal {
+  const out = {} as Record<CanonicalPayrollField, string | null>;
+  for (const field of CANONICAL_PAYROLL_FIELDS) {
+    const cell = state[field];
+    if (cell.absent) {
+      out[field] = null;
+    } else {
+      const trimmed = cell.value.trim();
+      if (trimmed.length === 0) {
+        // Defensive: should have been caught by validateFormState.
+        throw new Error(
+          `Field ${field} is marked present but value is blank`,
+        );
+      }
+      out[field] = trimmed;
+    }
+  }
+  return out as PayrollMappingProposal;
+}
+
+/**
+ * Return the list of canonical field names whose form cell is
+ * present (not absent) but has a blank value. Empty list means the
+ * form is safe to submit.
+ */
+function validateFormState(state: ProposalFormState): CanonicalPayrollField[] {
+  const issues: CanonicalPayrollField[] = [];
+  for (const field of CANONICAL_PAYROLL_FIELDS) {
+    const cell = state[field];
+    if (!cell.absent && cell.value.trim().length === 0) {
+      issues.push(field);
+    }
+  }
+  return issues;
+}
+
+type ApproveMappingResponse = {
+  mapping?: PlanDetailPayrollMapping;
+  audit_log_id?: string;
+  ingest_skipped?: boolean;
+  ingest_skip_reason?: string;
+  run?: PlanDetailPayrollRun;
+  record_count?: number;
+};
+
+function ProposedMappingCard({
+  plan,
+  files,
+  mapping,
+  payrollRuns,
+}: {
+  plan: PlanDetailPlan;
+  files: PlanDetailFile[];
+  mapping: PlanDetailPayrollMapping;
+  payrollRuns: PlanDetailPayrollRun[];
+}) {
+  const router = useRouter();
+
+  // Round-trip storage -> proposal once on mount via the parent's
+  // `key={mapping.id}` remount, so a fresh agent suggestion replaces
+  // any prior in-progress edits cleanly.
+  const [formState, setFormState] = useState<ProposalFormState>(() =>
+    proposalToFormState(fromStorageMapping(mapping.mapping)),
+  );
+  const [approver, setApprover] = useState("system_demo_user");
+  const [reason, setReason] = useState("");
+  const [submitting, setSubmitting] = useState<"approve" | "reject" | null>(
+    null,
+  );
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [successMsg, setSuccessMsg] = useState<string | null>(null);
+  const [rejectOpen, setRejectOpen] = useState(false);
+  const [rejectReason, setRejectReason] = useState("");
+
+  // Only `uploaded` runs are valid ingest targets; the approve route
+  // ignores everything else and would return ingest_skipped.
+  const uploadableRuns = payrollRuns.filter((r) => r.status === "uploaded");
+  const [selectedRunId, setSelectedRunId] = useState<string>(() => {
+    // listPayrollRunsForPlan returns most-recently-uploaded first, so
+    // the first uploadable run is also the most recent.
+    return uploadableRuns[0]?.id ?? "";
+  });
+
+  async function handleApprove() {
+    setSubmitting("approve");
+    setErrorMsg(null);
+    setSuccessMsg(null);
+
+    const issues = validateFormState(formState);
+    if (issues.length > 0) {
+      setErrorMsg(
+        `Field${issues.length === 1 ? "" : "s"} marked present but blank: ${issues.join(", ")}. Check "Not in CSV" if no column maps.`,
+      );
+      setSubmitting(null);
+      return;
+    }
+
+    try {
+      const proposal = formStateToProposal(formState);
+      const body: Record<string, unknown> = {
+        proposal,
+        approver_name: approver,
+      };
+      if (reason.trim().length > 0) body.reason = reason.trim();
+      if (selectedRunId) body.ingest_run_id = selectedRunId;
+
+      const res = await fetch(
+        `/api/plans/${plan.id}/payroll-mappings/${mapping.id}`,
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      const responseBody = (await res.json().catch(() => ({}))) as
+        | ApproveMappingResponse
+        | { error?: string; message?: string };
+      if (!res.ok) {
+        const e = responseBody as { error?: string; message?: string };
+        throw new Error(e.message ?? e.error ?? `PATCH ${res.status}`);
+      }
+      const ok = responseBody as ApproveMappingResponse;
+      const summary =
+        ok.record_count !== undefined && ok.record_count !== null
+          ? `${ok.record_count} record${ok.record_count === 1 ? "" : "s"} ingested.`
+          : ok.ingest_skipped
+            ? `Ingest skipped: ${ok.ingest_skip_reason ?? "no reason given"}.`
+            : "No run to ingest.";
+      setSuccessMsg(`Approved. ${summary}`);
+      router.refresh();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Approval failed");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  async function handleReject() {
+    setSubmitting("reject");
+    setErrorMsg(null);
+    setSuccessMsg(null);
+    try {
+      const res = await fetch(
+        `/api/plans/${plan.id}/payroll-mappings/${mapping.id}/reject`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            reviewer_name: approver,
+            reason: rejectReason,
+          }),
+        },
+      );
+      const body = (await res.json().catch(() => ({}))) as {
+        error?: string;
+        message?: string;
+      };
+      if (!res.ok) {
+        throw new Error(body.message ?? body.error ?? `POST ${res.status}`);
+      }
+      setRejectOpen(false);
+      setRejectReason("");
+      router.refresh();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : "Rejection failed");
+    } finally {
+      setSubmitting(null);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Pending payroll mapping</CardTitle>
+        <CardDescription>
+          <span className="font-mono">{mapping.name}</span> · suggested by{" "}
+          <span className="font-mono">{mapping.suggested_by ?? "—"}</span> at{" "}
+          <span className="font-mono">
+            {new Date(mapping.suggested_at).toLocaleString()}
+          </span>
+          . Edit the CSV column for any field below, then Approve to ingest
+          the selected run, or Reject to discard this proposal.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        <dl className="grid grid-cols-[max-content_1fr] gap-x-4 gap-y-3 text-sm">
+          {CANONICAL_PAYROLL_FIELDS.map((field) => {
+            const hint = payrollMappingFieldUiHints[field];
+            const cell = formState[field];
+            return (
+              <div key={field} className="contents">
+                <dt className="flex flex-col text-muted-foreground">
+                  <span className="font-mono">{hint.label}</span>
+                  {hint.hint && (
+                    <span className="text-[10px] text-muted-foreground/60">
+                      {hint.hint}
+                    </span>
+                  )}
+                </dt>
+                <dd className="flex flex-col gap-1 font-mono">
+                  <Input
+                    type="text"
+                    value={cell.value}
+                    placeholder={cell.absent ? "(not in CSV)" : "CSV column"}
+                    disabled={cell.absent || submitting !== null}
+                    onChange={(e) =>
+                      setFormState((s) => ({
+                        ...s,
+                        [field]: { ...s[field], value: e.target.value },
+                      }))
+                    }
+                    className="font-mono"
+                    data-field={field}
+                  />
+                  <label className="inline-flex items-center gap-2 text-[10px] text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked={cell.absent}
+                      disabled={submitting !== null}
+                      onChange={(e) =>
+                        setFormState((s) => ({
+                          ...s,
+                          [field]: {
+                            value: e.target.checked ? "" : s[field].value,
+                            absent: e.target.checked,
+                          },
+                        }))
+                      }
+                    />
+                    Not in CSV
+                  </label>
+                </dd>
+              </div>
+            );
+          })}
+        </dl>
+
+        <div className="flex flex-col gap-3 rounded-md border border-foreground/10 bg-muted/40 p-4">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+            <label className="flex flex-1 flex-col gap-1 text-xs text-muted-foreground">
+              Approver name
+              <Input
+                value={approver}
+                onChange={(e) => setApprover(e.target.value)}
+                disabled={submitting !== null}
+                className="font-mono"
+              />
+            </label>
+            {uploadableRuns.length > 0 && (
+              <label className="flex flex-1 flex-col gap-1 text-xs text-muted-foreground">
+                Apply to run
+                <select
+                  value={selectedRunId}
+                  disabled={submitting !== null}
+                  onChange={(e) => setSelectedRunId(e.target.value)}
+                  className="h-9 rounded-md border border-input bg-background px-3 text-sm font-mono"
+                >
+                  {uploadableRuns.map((r) => {
+                    const file = files.find(
+                      (f) => f.id === r.source_file_id,
+                    );
+                    const label = file?.filename ?? `${r.id.slice(0, 8)}…`;
+                    return (
+                      <option key={r.id} value={r.id}>
+                        {label}
+                      </option>
+                    );
+                  })}
+                </select>
+              </label>
+            )}
+          </div>
+
+          <label className="flex flex-col gap-1 text-xs text-muted-foreground">
+            Reason (optional, ≤ 2000 chars)
+            <textarea
+              maxLength={2000}
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+              disabled={submitting !== null}
+              placeholder="Optional note for the audit log, e.g. 'Cleaned up 401k column name'."
+              className="min-h-16 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            />
+          </label>
+
+          <div className="flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setRejectOpen(true)}
+              disabled={
+                submitting !== null || approver.trim().length === 0
+              }
+            >
+              Reject
+            </Button>
+            <Button
+              type="button"
+              onClick={handleApprove}
+              disabled={
+                submitting !== null || approver.trim().length === 0
+              }
+            >
+              {submitting === "approve" ? "Approving…" : "Approve"}
+            </Button>
+          </div>
+
+          {errorMsg && (
+            <p className="text-xs text-red-600 dark:text-red-400">
+              {errorMsg}
+            </p>
+          )}
+          {successMsg && (
+            <p className="text-xs text-green-700 dark:text-green-400">
+              {successMsg}
+            </p>
+          )}
+        </div>
+      </CardContent>
+
+      <Dialog open={rejectOpen} onOpenChange={setRejectOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Reject payroll mapping</DialogTitle>
+            <DialogDescription>
+              The pending mapping will be flipped to{" "}
+              <span className="font-mono">status=rejected</span> and the
+              reason will be written to the audit log. The Payroll
+              Mapping Agent can be re-run to produce a fresh proposal.
+            </DialogDescription>
+          </DialogHeader>
+          <textarea
+            className="min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            placeholder="Why is this rejection? e.g. wrong columns picked, agent guessed pay_date as gross_wages."
+            value={rejectReason}
+            onChange={(e) => setRejectReason(e.target.value)}
+          />
+          {errorMsg && (
+            <p className="text-xs text-red-600 dark:text-red-400">
+              {errorMsg}
+            </p>
+          )}
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setRejectOpen(false)}
+              disabled={submitting === "reject"}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              onClick={handleReject}
+              disabled={
+                submitting === "reject" || rejectReason.trim().length === 0
+              }
+            >
+              {submitting === "reject" ? "Rejecting…" : "Confirm reject"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Approved payroll mapping card (read-only summary of the current mapping).
+// ---------------------------------------------------------------------------
+
+function ApprovedMappingCard({
+  mapping,
+}: {
+  mapping: PlanDetailPayrollMapping;
+}) {
+  // Render in canonical-field order so two mappings for the same
+  // plan visually diff field-by-field instead of by header alphabetic
+  // order. Storage shape is CSV-keyed, so invert here.
+  const proposal = fromStorageMapping(mapping.mapping);
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Approved payroll mapping</CardTitle>
+        <CardDescription>
+          <span className="font-mono">{mapping.name}</span> · approved by{" "}
+          <span className="font-mono">{mapping.approved_by ?? "—"}</span> at{" "}
+          <span className="font-mono">
+            {mapping.approved_at
+              ? new Date(mapping.approved_at).toLocaleString()
+              : "—"}
+          </span>
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <details className="text-xs">
+          <summary className="cursor-pointer text-muted-foreground">
+            Show CSV column → canonical field pairs
+          </summary>
+          <dl className="mt-2 grid grid-cols-[max-content_max-content_1fr] gap-x-3 gap-y-1 font-mono">
+            {CANONICAL_PAYROLL_FIELDS.map((field) => {
+              const csv = proposal[field];
+              return (
+                <div key={field} className="contents">
+                  <dt>{field}</dt>
+                  <dd className="text-muted-foreground">←</dd>
+                  <dd>
+                    {csv ?? <span className="text-muted-foreground">—</span>}
+                  </dd>
+                </div>
+              );
+            })}
+          </dl>
+        </details>
+      </CardContent>
+    </Card>
+  );
 }

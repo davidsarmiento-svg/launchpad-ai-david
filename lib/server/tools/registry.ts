@@ -9,6 +9,11 @@ import {
   importParticipantsInputSchema,
 } from "@/lib/server/participants";
 import {
+  payrollMappingProposalJsonSchema,
+  payrollMappingProposalSchema,
+} from "@/lib/server/payroll-mapping";
+import { proposeMapping } from "@/lib/server/payroll-mappings";
+import {
   extractedPlanFieldsJsonSchema,
   extractedPlanFieldsSchema,
 } from "@/lib/server/plan-extraction";
@@ -511,6 +516,231 @@ const flagParticipantIssue: ToolDefinition<FlagParticipantIssueInput> = {
 };
 
 // ---------------------------------------------------------------------------
+// propose_payroll_mapping
+// ---------------------------------------------------------------------------
+
+const proposePayrollMappingInputSchema = z.object({
+  plan_id: z.string().uuid(),
+  name: z.string().min(1).max(255),
+  mapping: payrollMappingProposalSchema,
+  reason: z.string().min(1).max(2000),
+});
+
+type ProposePayrollMappingInput = z.infer<
+  typeof proposePayrollMappingInputSchema
+>;
+
+const proposePayrollMapping: ToolDefinition<ProposePayrollMappingInput> = {
+  name: "propose_payroll_mapping",
+  description:
+    "Persist a proposed payroll-CSV column mapping for human review. " +
+    "The mapping links CSV header columns to the canonical payroll " +
+    "fields. After this call the mapping row is in 'pending' status; " +
+    "a human operator approves or rejects before any payroll_records " +
+    "get ingested. Call this exactly once after analyzing the CSV " +
+    "header + sample rows.",
+  inputJsonSchema: {
+    type: "object",
+    properties: {
+      plan_id: {
+        type: "string",
+        description: "uuid of the plans row this mapping belongs to.",
+      },
+      name: {
+        type: "string",
+        description:
+          "Short human-readable label for this mapping, e.g. 'ACME " +
+          "payroll CSV (Pay Period 2026-04)' or 'Auto-detected ACME " +
+          "payroll'.",
+      },
+      mapping: payrollMappingProposalJsonSchema,
+      reason: {
+        type: "string",
+        description:
+          "1-3 sentences explaining notable choices: e.g. which column " +
+          "you picked over a near-synonym, any flagged columns, why a " +
+          "canonical field was left null. Becomes the audit-log reason " +
+          "for the human reviewer.",
+      },
+    },
+    required: ["plan_id", "name", "mapping", "reason"],
+    additionalProperties: false,
+  },
+  inputSchema: proposePayrollMappingInputSchema,
+  async handler(input, ctx) {
+    try {
+      const row = await proposeMapping({
+        plan_id: input.plan_id,
+        name: input.name,
+        proposal: input.mapping,
+        suggested_by: ctx.actor_name,
+      });
+
+      await writeAuditLog({
+        actor_type: "agent",
+        actor_name: ctx.actor_name,
+        action: "PAYROLL_MAPPING_PROPOSED",
+        entity_type: "plan",
+        entity_id: input.plan_id,
+        after_value: {
+          mapping_id: row.id,
+          name: row.name,
+          mapping: row.mapping,
+        },
+        reason: input.reason,
+        status: "in_review",
+      });
+
+      return {
+        ok: true,
+        data: {
+          mapping_id: row.id,
+          status: row.status,
+          name: row.name,
+        },
+      };
+    } catch (err) {
+      if (err instanceof DataLayerError) {
+        return { ok: false, error: err.message };
+      }
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
+// flag_mapping_issue
+// ---------------------------------------------------------------------------
+
+const flagMappingIssueInputSchema = z.object({
+  source_file_id: z.string().uuid(),
+  /**
+   * null when the issue is "no CSV column maps to canonical field X"
+   * (a missing-column flag); a string when the issue is about a
+   * specific column the CSV does contain.
+   */
+  csv_column: z.string().min(1).max(255).nullable(),
+  severity: z.enum(["low", "medium", "high"]),
+  /** SCREAMING_SNAKE, e.g. AMBIGUOUS_CANDIDATE, UNKNOWN_COLUMN. */
+  issue_code: z.string().min(1).max(64),
+  description: z.string().min(1).max(2000),
+  sample_values: z.array(z.string()).max(10).optional(),
+  /**
+   * Up to 11 canonical-field names this column could plausibly map
+   * to. 11 = length of CANONICAL_PAYROLL_FIELDS, which is the
+   * theoretical upper bound.
+   */
+  candidate_canonical_fields: z.array(z.string()).max(11).optional(),
+});
+
+type FlagMappingIssueInput = z.infer<typeof flagMappingIssueInputSchema>;
+
+const flagMappingIssue: ToolDefinition<FlagMappingIssueInput> = {
+  name: "flag_mapping_issue",
+  description:
+    "Record a column-level mapping issue noticed in the payroll CSV " +
+    "header -- for example, two columns that look like candidates for " +
+    "the same canonical field, an unknown column with no canonical " +
+    "home, or a missing required column. Use this when you want the " +
+    "human reviewer to see the issue alongside your proposed mapping; " +
+    "the issue does not block the proposal from landing.",
+  inputJsonSchema: {
+    type: "object",
+    properties: {
+      source_file_id: {
+        type: "string",
+        description: "uuid of the files row (the payroll CSV).",
+      },
+      csv_column: {
+        type: ["string", "null"],
+        description:
+          "The CSV column header the issue is about. null when the " +
+          "issue is about a canonical field with no matching column.",
+      },
+      severity: {
+        type: "string",
+        enum: ["low", "medium", "high"],
+        description:
+          "low for cosmetic/ambiguous; medium for likely-but-not-" +
+          "blocking; high for blocking (e.g. missing required field).",
+      },
+      issue_code: {
+        type: "string",
+        description:
+          "SCREAMING_SNAKE code, e.g. AMBIGUOUS_CANDIDATE, " +
+          "UNKNOWN_COLUMN, MISSING_REQUIRED_FIELD.",
+      },
+      description: {
+        type: "string",
+        description:
+          "One human-readable sentence explaining the issue. Becomes " +
+          "the audit-log reason.",
+      },
+      sample_values: {
+        type: "array",
+        items: { type: "string" },
+        maxItems: 10,
+        description:
+          "Optional: a few example values from this column to help " +
+          "the reviewer judge the call.",
+      },
+      candidate_canonical_fields: {
+        type: "array",
+        items: { type: "string" },
+        maxItems: 11,
+        description:
+          "Optional: canonical field name(s) this column might map " +
+          "to, or that the missing column would have mapped to.",
+      },
+    },
+    required: [
+      "source_file_id",
+      "csv_column",
+      "severity",
+      "issue_code",
+      "description",
+    ],
+    additionalProperties: false,
+  },
+  inputSchema: flagMappingIssueInputSchema,
+  async handler(input, ctx) {
+    try {
+      const row = await writeAuditLog({
+        actor_type: "agent",
+        actor_name: ctx.actor_name,
+        action: "PAYROLL_MAPPING_ISSUE",
+        entity_type: "file",
+        entity_id: input.source_file_id,
+        field_name: input.csv_column ?? undefined,
+        before_value: {
+          csv_column: input.csv_column,
+          issue_code: input.issue_code,
+          sample_values: input.sample_values ?? null,
+        },
+        after_value: {
+          candidate_canonical_fields:
+            input.candidate_canonical_fields ?? null,
+        },
+        reason: input.description,
+        status: input.severity,
+      });
+      return { ok: true, data: { audit_log_id: row.id } };
+    } catch (err) {
+      if (err instanceof DataLayerError) {
+        return { ok: false, error: err.message };
+      }
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -519,6 +749,8 @@ const ALL_TOOLS = [
   writeAuditLogTool,
   saveParticipants,
   flagParticipantIssue,
+  proposePayrollMapping,
+  flagMappingIssue,
 ] as const;
 
 const TOOLS_BY_NAME: Record<string, ToolDefinition<unknown>> =

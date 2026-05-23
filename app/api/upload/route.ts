@@ -2,6 +2,7 @@ import { z } from "zod";
 
 import { writeAuditLog } from "@/lib/server/audit-log";
 import { toErrorResponse } from "@/lib/server/http";
+import { createPayrollRun } from "@/lib/server/payroll-runs";
 import { uploadFile } from "@/lib/server/storage";
 
 export const dynamic = "force-dynamic";
@@ -103,11 +104,47 @@ export async function POST(request: Request) {
         : "Re-upload of identical bytes - returned existing files row",
     });
 
+    // Payroll uploads need a `payroll_runs` row to anchor the mapping
+    // and reconciliation pipeline. We only create one on the fresh-
+    // upload path: createPayrollRun is itself idempotent on
+    // source_file_id, but writing the PAYROLL_RUN_CREATED audit row
+    // only when `runCreated === true` keeps the audit ledger free of
+    // noise on dedupe re-uploads.
+    let payroll_run_id: string | undefined;
+    let payroll_run_created: boolean | undefined;
+    if (file.kind === "payroll_run" && file.plan_id) {
+      const { run, created: runCreated } = await createPayrollRun({
+        plan_id: file.plan_id,
+        source_file_id: file.id,
+      });
+      payroll_run_id = run.id;
+      payroll_run_created = runCreated;
+
+      if (runCreated) {
+        await writeAuditLog({
+          actor_type: "user",
+          actor_name: fields.uploaded_by ?? "system_demo_user",
+          action: "PAYROLL_RUN_CREATED",
+          entity_type: "payroll_run",
+          entity_id: run.id,
+          payroll_run_id: run.id,
+          after_value: {
+            plan_id: run.plan_id,
+            source_file_id: run.source_file_id,
+            status: run.status,
+          },
+          reason:
+            "payroll_runs row created on payroll_run upload via POST /api/upload",
+        });
+      }
+    }
+
     return Response.json(
       {
         file,
         created,
         audit_log_id: audit.id,
+        ...(payroll_run_id ? { payroll_run_id, payroll_run_created } : {}),
       },
       { status: created ? 201 : 200 },
     );

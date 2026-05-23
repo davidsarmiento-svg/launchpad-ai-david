@@ -2,12 +2,14 @@ import { notFound } from "next/navigation";
 
 import {
   PlanDetailClient,
+  type PlanDetailAuditLog,
   type PlanDetailFile,
   type PlanDetailParticipant,
   type PlanDetailPayrollMapping,
   type PlanDetailPayrollRun,
   type PlanDetailPlan,
 } from "@/components/plan-detail-client";
+import { listAuditLogsForPlan } from "@/lib/server/audit-log";
 import { listFilesForPlan } from "@/lib/server/files";
 import { listParticipants } from "@/lib/server/participants";
 import {
@@ -97,12 +99,22 @@ export default async function PlanDetailPage({
   // per open issue in parallel so a plan with many issues doesn't
   // serialize the per-issue fetches.
   const openIssues = issues.filter((i) => i.status === "open");
-  const fixListsForOpenIssues = await Promise.all(
-    openIssues.map((i) => listSuggestedFixesForIssue(i.id)),
+  const fixListsForAllIssues = await Promise.all(
+    issues.map((i) => listSuggestedFixesForIssue(i.id)),
   );
   const fixesByIssueId: Record<string, SuggestedFixRow[]> = {};
-  openIssues.forEach((issue, idx) => {
-    fixesByIssueId[issue.id] = fixListsForOpenIssues[idx];
+  issues.forEach((issue, idx) => {
+    if (issue.status === "open") {
+      fixesByIssueId[issue.id] = fixListsForAllIssues[idx];
+    }
+  });
+
+  const auditLogs = await listAuditLogsForPlan({
+    plan_id: id,
+    payroll_run_ids: payrollRuns.map((r) => r.id),
+    file_ids: files.map((f) => f.id),
+    reconciliation_issue_ids: issues.map((i) => i.id),
+    suggested_fix_ids: fixListsForAllIssues.flat().map((f) => f.id),
   });
 
   const planForClient: PlanDetailPlan = {
@@ -148,6 +160,23 @@ export default async function PlanDetailPage({
   const approvedMappingForClient: PlanDetailPayrollMapping | null =
     approvedMapping ? toClientMapping(approvedMapping) : null;
 
+  const auditLogsForClient: PlanDetailAuditLog[] = auditLogs.map((row) => ({
+    id: row.id,
+    timestamp: row.timestamp,
+    actor_type: row.actor_type,
+    actor_name: row.actor_name,
+    action: row.action,
+    entity_type: row.entity_type,
+    entity_id: row.entity_id,
+    payroll_run_id: row.payroll_run_id,
+    employee_id: row.employee_id,
+    field_name: row.field_name,
+    before_value: row.before_value,
+    after_value: row.after_value,
+    reason: row.reason,
+    status: row.status,
+  }));
+
   return (
     <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-6 py-12">
       <PlanDetailClient
@@ -159,6 +188,7 @@ export default async function PlanDetailPage({
         approvedMapping={approvedMappingForClient}
         issues={issues}
         fixesByIssueId={fixesByIssueId}
+        auditLogs={auditLogsForClient}
       />
     </div>
   );

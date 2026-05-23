@@ -37,8 +37,8 @@ MVP demo flow, and later stretch goals. Current status:
 | Participant Data | **MVP done** | Census upload/import is implemented; normalized participants render in the plan detail UI. Census data-quality issues currently live in `audit_logs`. |
 | Payroll Mapping | **MVP done** | Run 1 mapping agent proposes a mapping; user approves; later matching runs auto-apply the approved mapping. |
 | Payroll Runs | **MVP done** | All 5 demo runs upload + auto-map + reconcile end-to-end. |
-| Reconciliation Issues | **MVP done (uncommitted)** | Phase 9.1 runner/routes/UI all live; verified end-to-end across all 5 demo CSVs with deterministic safety nets in the runner + boundary guard against self-contradicting issues. See §4.14. |
-| Change Logs / Audit Trail | **Partial** | Audit writes are broad and consistent; `listAuditLogs` exists. A dedicated chronological Audit Trail UI is still needed for demo completeness. |
+| Reconciliation Issues | **MVP done** | Phase 9.1 runner/routes/UI committed in `b14307e`; verified end-to-end across all 5 demo CSVs. See §4.14. |
+| Change Logs / Audit Trail | **MVP done** | `listAuditLogsForPlan` + `<AuditTrailCard>` on plan detail; chronological ledger of user/agent/system actions. See §4.15. |
 | AI Onboarding Assistant | **Not started** | Planned as Phase 9.2 after reconciliation; will reuse the existing tool registry and data-access layer. |
 
 Agent coverage:
@@ -48,8 +48,8 @@ Agent coverage:
 | Plan Extraction Agent | **Done** | Uses `skills/plan-extraction/SKILL.md`, Claude tool loop, and audited save path. |
 | Payroll Mapping Agent | **Done** | Uses `skills/payroll-mapping/SKILL.md`, proposes pending mappings, and requires user approval. |
 | Participant Import Agent | **Done** | Uses `skills/participant-import/SKILL.md`; imports normalized participants and flags census issues into audit logs. |
-| Payroll Reconciliation Agent | **MVP done (uncommitted)** | Live across all 5 demo runs. Runner does deterministic pre-checks (DUPLICATE_PAY_PERIOD; pre-computed `expected_pretax` / `expected_roth` / `expected_employer_match` per record) before invoking Claude. Tool handler refuses self-contradicting issue proposals at the boundary. See §4.14. |
-| Onboarding Assistant Agent | **Not started** | Build last, after reconciliation issues and audit trail are stable. |
+| Payroll Reconciliation Agent | **MVP done** | Committed in Phase 9.1 (`b14307e`). See §4.14. |
+| Onboarding Assistant Agent | **Not started** | Build after audit trail is committed; will reuse the existing tool registry and data-access layer. |
 
 MVP coverage:
 
@@ -61,7 +61,7 @@ MVP coverage:
 | Upload Payroll Run 2 and detect basic errors | **Done** — all 5 expected data_quality codes fire (MISSING_EMPLOYEE_ID, MALFORMED_EMAIL, MISSING_GROSS_WAGES, BLANK_EMPLOYMENT_STATUS, DUPLICATE_ROW). |
 | Display reconciliation issues with suggested fixes | **Done** — `ReconciliationIssuesCard` renders open + resolved issues with inline Approve / Reject / Mark resolved / Ignore controls. |
 | User approval gate before any fix is applied | **Done** — `PATCH /suggested-fixes/[id]` atomically approves + applies under optimistic concurrency; agent never writes to data tables. Verified across `payroll_record.update` (Runs 2/4) and `participant.create_from_payroll` (Run 4 E031). |
-| Audit log visible in the dashboard | **Partial**; data layer exists, dedicated UI still missing |
+| Audit log visible in the dashboard | **Done** — `<AuditTrailCard>` on plan detail; see §4.15. |
 | AI assistant that answers basic questions using tools | **Not started** |
 
 Stretch goals stay secondary:
@@ -72,9 +72,8 @@ Stretch goals stay secondary:
 - Assistant chat history: after the assistant itself works.
 - PDF export: last, only if the MVP is stable.
 
-Demo-day success now depends on committing Phase 9.1, adding a visible
-Audit Trail module, building the Onboarding Assistant, applying prod
-migrations, and redeploying the current app to Vercel.
+Demo-day success now depends on building the Onboarding Assistant,
+applying prod migrations, and redeploying the current app to Vercel.
 
 ---
 
@@ -103,7 +102,8 @@ Before writing any code, read these in this order:
 ## 3. Current commit graph + worktree
 
 ```text
-(HEAD)  Phase 9.1: Payroll Reconciliation Agent (UNCOMMITTED)
+(HEAD)  Audit Trail UI
+b14307e Phase 9.1: Payroll Reconciliation Agent
 c8c8916 Phase 9.0: Payroll Mapping Agent
 e858218 docs: update handoff for Phases 5/6/7/7.5/8 commits
 3dda65a Phase 8: Participant Import Agent
@@ -119,14 +119,10 @@ c4b7cdb Session 3 scaffold: UI kit, theme, hello API route, deployment guide
 f01795d Initial scaffold: Next.js + shadcn
 ```
 
-Branch `main` is **7 commits ahead** of `origin/main` at
+Branch `main` is **9 commits ahead** of `origin/main` at
 https://github.com/davidsarmiento-svg/launchpad-ai-david — push when
-ready. Phase 9.1 is present as unstaged/tracked edits plus untracked
-new files in the worktree, but it is not yet committed (awaiting
-explicit user sign-off; per CLAUDE.md, commits are explicit). All
-committed phases have lint + build clean; Phase 9.1 was also verified
-with `npm run build`, `npx tsc --noEmit`, and ReadLints clean during
-the implementation session.
+ready. Phase 9.1 and Audit Trail UI are committed. All phases have
+lint + build clean.
 
 End-to-end signals against launchpad-dev:
 
@@ -944,6 +940,36 @@ tool naming differs from the doc's `reconcile_payroll_run` /
 shortcuts; revisit if the project ever needs to expose tools to
 external MCP clients.
 
+### 4.15 Audit Trail UI (commit after Phase 9.1)
+
+Surfaces the append-only `audit_logs` ledger on the plan detail page
+so demo operators can answer "who did what, when, and why" without
+querying Supabase directly.
+
+**DAL extension** (`lib/server/audit-log.ts`):
+
+- `listAuditLogsForPlan({ plan_id, payroll_run_ids, file_ids,
+  reconciliation_issue_ids, suggested_fix_ids, limit? })` — OR-matches
+  every audit row tied to the plan via entity links (plan, payroll
+  runs, files, issues, fixes). Returns oldest-first (chronological)
+  by taking the most recent N rows (default/max 500) then reversing.
+
+**Server page** (`app/plans/[id]/page.tsx`):
+
+- Fetches suggested fixes for all issues (not just open) so fix
+  approval/reject audit rows are included in the scope filter.
+- Passes `auditLogs` to `PlanDetailClient`.
+
+**UI** (`components/plan-detail-client.tsx`):
+
+- `<AuditTrailCard>` — table with When / Actor / Action / Context /
+  Details columns. Actor badges distinguish user / agent / system.
+  Details column shows reason, before/after previews, and status.
+
+Placement: after Approved Mapping, before Participants — the trail
+spans the full onboarding lifecycle and reads top-to-bottom as a
+timeline.
+
 ---
 
 ## 5. Schema design — quick reference
@@ -1232,24 +1258,22 @@ click **Map run**, review/edit/approve the agent's proposed mapping,
 and the same approval click ingests the run's `payroll_records`.
 Subsequent CSVs with matching headers auto-apply with no agent call.
 
-### 7.9 Phase 9.1 — Payroll Reconciliation Agent (DONE, UNCOMMITTED)
+### 7.9 Phase 9.1 — Payroll Reconciliation Agent (DONE)
 
-Shipped. Full details in §4.14. End-to-end verified across all 5
-demo CSVs with deterministic runner safety nets + boundary guard
-against self-contradicting issue proposals. Both pre-requisite
-migrations (`reconciliation_issues` nullable run + plan scope; and
-`related_issue_id` self-FK) applied to launchpad-dev. The
-follow-up to backfill existing `PARTICIPANT_DATA_QUALITY_ISSUE` /
-`PAYROLL_MAPPING_ISSUE` audit rows into `reconciliation_issues` is
-deferred until the Audit Trail / Issues UI requires it. Known
-limitations enumerated in §4.14.
+Shipped in commit `b14307e`. Full details in §4.14.
 
 **Immediate carry-over before Phase 9.2:**
 
 1. Apply both Phase 9.1 migrations to launchpad-prod before any
    prod reconciliation work.
 
-### 7.10 Phase 9.2 — Onboarding Assistant (NEXT)
+### 7.10 Audit Trail UI (DONE)
+
+Shipped. Full details in §4.15. Plan detail now renders a
+chronological audit ledger covering plan creation, uploads, agent
+runs, reconciliation, and fix approval/apply chains.
+
+### 7.11 Phase 9.2 — Onboarding Assistant (NEXT)
 
 Conversational agent that walks the operator through the full
 onboarding flow. Reuses skills, tools, and approval-card patterns
@@ -1261,14 +1285,12 @@ questions without mutating data. The non-negotiable rule from
 "fix this", the assistant must surface a `suggested_fix` card and
 wait for explicit approval before invoking the apply pipeline.
 
-### 7.11 Eventually: production deploy alignment
+### 7.12 Eventually: production deploy alignment
 - Reconnect GitHub in the Vercel dashboard so pushes auto-deploy.
-- Commit Phase 9.1 if the current worktree is accepted.
 - Apply migrations to launchpad-prod (now six: audit_logs, domain
   schema, storage bucket, payroll_mappings rejected status, Phase 9.1
   plan-scope issue migration, Phase 9.1 related-issue migration).
-- Push the seven committed phases plus the Phase 9.1 commit to
-  `origin/main` (`git push`) once ready.
+- Push all nine commits to `origin/main` (`git push`) once ready.
 - Run the smoke tests from
   [docs/deployment-and-production-readiness.md §End-To-End Pre-Launch Checklist](deployment-and-production-readiness.md).
 - Turn off Vercel deployment protection if the demo URL should be
@@ -1309,10 +1331,8 @@ Resolved context:
 
 Before writing any code, confirm:
 
-- [ ] `git status` is clean, or it contains only the documented Phase
-      9.1 worktree files from §4.14 plus this handoff edit, and you are
-      on `main`.
-- [ ] `git log --oneline -5` matches §3.
+- [ ] `git status` is clean and you are on `main`.
+- [ ] `git log --oneline -5` shows Audit Trail at HEAD.
 - [ ] `npm install` completes without error.
 - [ ] `.env.local` contains all four required keys
       (`NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
@@ -1359,6 +1379,9 @@ Before writing any code, confirm:
       audit chain (`FIX_APPROVED`, `FIX_APPLIED`, and `FIELD_UPDATED`
       when a field changes); rejecting requires a reason and writes
       `FIX_REJECTED`.
+- [ ] Plan detail page shows an **Audit trail** card with chronological
+      entries (PLAN_CREATED, FILE_UPLOADED, agent actions, fix
+      approvals) after running the demo flow.
 
 ---
 

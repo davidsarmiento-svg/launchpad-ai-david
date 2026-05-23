@@ -138,3 +138,81 @@ export async function listAuditLogs(
 
   return (data ?? []) as AuditLogRow[];
 }
+
+/**
+ * Scope filters for `listAuditLogsForPlan`. The caller supplies the
+ * related entity ids the page already loaded (runs, files, issues,
+ * fixes) so we can OR-match every audit row tied to this plan without
+ * a plan_id column on `audit_logs`.
+ */
+export const listAuditLogsForPlanInputSchema = z.object({
+  plan_id: z.string().uuid(),
+  payroll_run_ids: z.array(z.string().uuid()).default([]),
+  file_ids: z.array(z.string().uuid()).default([]),
+  reconciliation_issue_ids: z.array(z.string().uuid()).default([]),
+  suggested_fix_ids: z.array(z.string().uuid()).default([]),
+  limit: z.number().int().positive().max(500).default(500),
+});
+
+export type ListAuditLogsForPlanInput = z.input<
+  typeof listAuditLogsForPlanInputSchema
+>;
+
+function quotedIn(values: string[]): string {
+  return values.map((id) => `"${id}"`).join(",");
+}
+
+/**
+ * Read audit-log rows scoped to a plan. Returns oldest-first so the
+ * Audit Trail UI reads as a chronological ledger. Caps at `limit`
+ * (default/max 500) by taking the most recent N rows, then reversing.
+ */
+export async function listAuditLogsForPlan(
+  input: ListAuditLogsForPlanInput,
+): Promise<AuditLogRow[]> {
+  const parsed = listAuditLogsForPlanInputSchema.parse(input);
+
+  const orParts: string[] = [
+    `and(entity_type.eq.plan,entity_id.eq.${parsed.plan_id})`,
+  ];
+
+  if (parsed.payroll_run_ids.length > 0) {
+    orParts.push(`payroll_run_id.in.(${quotedIn(parsed.payroll_run_ids)})`);
+  }
+  if (parsed.file_ids.length > 0) {
+    orParts.push(
+      `and(entity_type.eq.file,entity_id.in.(${quotedIn(parsed.file_ids)}))`,
+    );
+  }
+  if (parsed.reconciliation_issue_ids.length > 0) {
+    orParts.push(
+      `and(entity_type.eq.reconciliation_issue,entity_id.in.(${quotedIn(parsed.reconciliation_issue_ids)}))`,
+    );
+  }
+  if (parsed.suggested_fix_ids.length > 0) {
+    orParts.push(
+      `and(entity_type.eq.suggested_fix,entity_id.in.(${quotedIn(parsed.suggested_fix_ids)}))`,
+    );
+  }
+
+  const supabase = getSupabaseServiceRoleClient();
+  const { data, error } = await supabase
+    .from("audit_logs")
+    .select("*")
+    .or(orParts.join(","))
+    .order("timestamp", { ascending: false })
+    .limit(parsed.limit);
+
+  if (error) {
+    throw new DataLayerError({
+      module: "audit-log",
+      operation: "listAuditLogsForPlan",
+      message: error.message,
+      cause: error,
+    });
+  }
+
+  const rows = (data ?? []) as AuditLogRow[];
+  rows.reverse();
+  return rows;
+}

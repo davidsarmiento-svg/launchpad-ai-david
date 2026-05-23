@@ -143,6 +143,24 @@ export type PlanDetailPayrollMapping = {
   status: "pending" | "approved" | "superseded" | "rejected";
 };
 
+/** Narrowing of `AuditLogRow` for the Audit Trail card. */
+export type PlanDetailAuditLog = {
+  id: string;
+  timestamp: string;
+  actor_type: "user" | "agent" | "system";
+  actor_name: string;
+  action: string;
+  entity_type: string | null;
+  entity_id: string | null;
+  payroll_run_id: string | null;
+  employee_id: string | null;
+  field_name: string | null;
+  before_value: unknown;
+  after_value: unknown;
+  reason: string | null;
+  status: string | null;
+};
+
 type AgentToolCall = {
   iteration: number;
   tool_use_id: string;
@@ -256,6 +274,7 @@ export function PlanDetailClient({
   approvedMapping,
   issues,
   fixesByIssueId,
+  auditLogs,
 }: {
   plan: PlanDetailPlan;
   files: PlanDetailFile[];
@@ -265,6 +284,7 @@ export function PlanDetailClient({
   approvedMapping: PlanDetailPayrollMapping | null;
   issues: ReconciliationIssueRow[];
   fixesByIssueId: Record<string, SuggestedFixRow[]>;
+  auditLogs: PlanDetailAuditLog[];
 }) {
   const router = useRouter();
   // `running` holds the file_id or run_id whose agent run is currently
@@ -551,6 +571,8 @@ export function PlanDetailClient({
       {approvedMapping && (
         <ApprovedMappingCard mapping={approvedMapping} />
       )}
+
+      <AuditTrailCard auditLogs={auditLogs} />
 
       <ParticipantsCard participants={participants} />
     </>
@@ -2472,5 +2494,143 @@ function IssueCard({
         </DialogContent>
       </Dialog>
     </article>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Audit Trail — chronological ledger of every user / agent / system action.
+// ---------------------------------------------------------------------------
+
+const ACTOR_VARIANT: Record<
+  PlanDetailAuditLog["actor_type"],
+  "secondary" | "default" | "destructive"
+> = {
+  user: "default",
+  agent: "secondary",
+  system: "secondary",
+};
+
+function formatAuditTimestamp(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function shortId(id: string | null): string {
+  if (!id) return "";
+  return id.length <= 10 ? id : `${id.slice(0, 8)}…`;
+}
+
+function formatAuditContext(row: PlanDetailAuditLog): string {
+  const parts: string[] = [];
+  if (row.entity_type) {
+    parts.push(row.entity_type);
+    if (row.entity_id) parts.push(shortId(row.entity_id));
+  }
+  if (row.payroll_run_id) {
+    parts.push(`run ${shortId(row.payroll_run_id)}`);
+  }
+  if (row.employee_id) {
+    parts.push(`employee ${row.employee_id}`);
+  }
+  if (row.field_name) {
+    parts.push(`field ${row.field_name}`);
+  }
+  return parts.length > 0 ? parts.join(" · ") : "—";
+}
+
+function previewJson(value: unknown): string | null {
+  if (value == null) return null;
+  if (typeof value === "string") return value;
+  try {
+    const text = JSON.stringify(value);
+    return text.length > 120 ? `${text.slice(0, 117)}…` : text;
+  } catch {
+    return String(value);
+  }
+}
+
+function AuditTrailCard({ auditLogs }: { auditLogs: PlanDetailAuditLog[] }) {
+  const count = auditLogs.length;
+  const description =
+    count === 0
+      ? "No audit entries yet for this plan."
+      : count === 500
+        ? "Showing the most recent 500 entries in chronological order."
+        : `${count} entr${count === 1 ? "y" : "ies"} in chronological order.`;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Audit trail</CardTitle>
+        <CardDescription>{description}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        {count === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            Actions such as plan creation, file uploads, agent runs, and
+            fix approvals will appear here once they occur.
+          </p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="w-[140px]">When</TableHead>
+                <TableHead className="w-[160px]">Actor</TableHead>
+                <TableHead className="w-[180px]">Action</TableHead>
+                <TableHead>Context</TableHead>
+                <TableHead>Details</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {auditLogs.map((row) => {
+                const beforePreview = previewJson(row.before_value);
+                const afterPreview = previewJson(row.after_value);
+                const detailParts: string[] = [];
+                if (row.reason) detailParts.push(row.reason);
+                if (beforePreview) detailParts.push(`before: ${beforePreview}`);
+                if (afterPreview) detailParts.push(`after: ${afterPreview}`);
+                if (row.status) detailParts.push(`status: ${row.status}`);
+
+                return (
+                  <TableRow key={row.id}>
+                    <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
+                      {formatAuditTimestamp(row.timestamp)}
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex flex-col gap-1">
+                        <Badge variant={ACTOR_VARIANT[row.actor_type]}>
+                          {row.actor_type}
+                        </Badge>
+                        <span className="text-xs">{row.actor_name}</span>
+                      </div>
+                    </TableCell>
+                    <TableCell className="font-mono text-xs">
+                      {row.action}
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {formatAuditContext(row)}
+                    </TableCell>
+                    <TableCell className="max-w-xs text-xs">
+                      {detailParts.length > 0 ? (
+                        <span className="break-words">{detailParts.join(" · ")}</span>
+                      ) : (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
   );
 }

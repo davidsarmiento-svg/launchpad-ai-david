@@ -47,6 +47,7 @@ import type {
   ReconciliationIssueSeverity,
 } from "@/lib/server/reconciliation-issues";
 import type { SuggestedFixRow } from "@/lib/server/suggested-fixes";
+import type { PlanDashboardSection } from "@/lib/plan-dashboard-sections";
 
 /**
  * Plan detail screen.
@@ -255,17 +256,8 @@ type LatestRun =
   | { kind: "map"; data: MapResponse }
   | { kind: "reconcile"; data: ReconcileResponse };
 
-const STATUS_VARIANT: Record<
-  PlanDetailPlan["extraction_status"],
-  "secondary" | "default" | "destructive"
-> = {
-  pending: "secondary",
-  in_review: "default",
-  approved: "default",
-  failed: "destructive",
-};
-
 export function PlanDetailClient({
+  section,
   plan,
   files,
   participants,
@@ -276,6 +268,7 @@ export function PlanDetailClient({
   fixesByIssueId,
   auditLogs,
 }: {
+  section: PlanDashboardSection;
   plan: PlanDetailPlan;
   files: PlanDetailFile[];
   participants: PlanDetailParticipant[];
@@ -297,6 +290,17 @@ export function PlanDetailClient({
   const [error, setError] = useState<ExtractError | string | null>(null);
 
   const planPdfs = files.filter((f) => f.kind === "plan_pdf");
+  const censusFiles = files.filter((f) => f.kind === "participant_census");
+  const payrollFiles = files.filter((f) => f.kind === "payroll_run");
+
+  const showLatest =
+    latest &&
+    ((section === "plan-details" && latest.kind === "extract") ||
+      (section === "participants" && latest.kind === "import") ||
+      (section === "payroll-mapping" && latest.kind === "map") ||
+      (section === "payroll-runs" &&
+        (latest.kind === "map" || latest.kind === "reconcile")) ||
+      (section === "issues" && latest.kind === "reconcile"));
 
   async function handleExtract(file_id: string) {
     setRunning(file_id);
@@ -422,125 +426,97 @@ export function PlanDetailClient({
 
   return (
     <>
-      <div className="flex flex-col gap-2">
-        <Link
-          href="/"
-          className="text-xs text-muted-foreground hover:underline"
-        >
-          ← Back to home
-        </Link>
-        <div className="flex items-baseline justify-between gap-4">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            {plan.employer_name}
-          </h1>
-          <Badge variant={STATUS_VARIANT[plan.extraction_status]}>
-            {plan.extraction_status}
-          </Badge>
-        </div>
-        <p className="text-sm text-muted-foreground">
-          Plan id:{" "}
-          <span className="font-mono">{plan.id}</span>
-          {plan.plan_year ? ` · plan year ${plan.plan_year}` : ""}
-        </p>
-      </div>
-
-      <Card>
-        <CardHeader>
-          <CardTitle>Files</CardTitle>
-          <CardDescription>
-            Every artifact uploaded for this plan. Click{" "}
-            <span className="font-mono">Run extraction</span> on a{" "}
-            <span className="font-mono">plan_pdf</span> to invoke the Plan
-            Extraction Agent, or{" "}
-            <span className="font-mono">Run import</span> on a{" "}
-            <span className="font-mono">participant_census</span> to invoke
-            the Participant Import Agent.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3">
-          {files.length === 0 && (
-            <p className="text-sm text-muted-foreground">
-              No files yet. Upload one from the home page.
-            </p>
-          )}
-          {files.map((f) => (
-            <div
-              key={f.id}
-              className="flex items-center justify-between gap-4 rounded-md border border-foreground/10 bg-muted/30 px-3 py-2 text-sm"
-            >
-              <div className="flex flex-col">
-                <span className="font-mono">{f.filename}</span>
-                <span className="text-xs text-muted-foreground">
-                  {f.kind} · {f.size_bytes ?? "—"} bytes ·{" "}
-                  {new Date(f.uploaded_at).toLocaleString()}
-                </span>
-              </div>
-              {f.kind === "plan_pdf" && (
-                <Button
-                  type="button"
-                  size="sm"
-                  onClick={() => handleExtract(f.id)}
-                  disabled={running !== null}
-                >
-                  {running === f.id ? "Extracting…" : "Run extraction"}
-                </Button>
-              )}
-              {f.kind === "participant_census" && (
-                <Button
-                  type="button"
-                  size="sm"
-                  onClick={() => handleImport(f.id)}
-                  disabled={running !== null}
-                >
-                  {running === f.id ? "Importing…" : "Run import"}
-                </Button>
-              )}
-            </div>
-          ))}
-          {planPdfs.length === 0 && files.length > 0 && (
-            <p className="text-xs text-muted-foreground">
-              Upload a <span className="font-mono">plan_pdf</span> from the
-              home page to enable extraction.
-            </p>
-          )}
-        </CardContent>
-      </Card>
-
-      {error && (
+      {(section === "plan-details" || section === "participants") && (
         <Card>
           <CardHeader>
-            <CardTitle>Extraction error</CardTitle>
+            <CardTitle>
+              {section === "plan-details" ? "Plan documents" : "Census files"}
+            </CardTitle>
+            <CardDescription>
+              {section === "plan-details"
+                ? "Uploaded plan PDFs. Run extraction to populate plan details below."
+                : "Uploaded census CSVs. Run import to load participant records."}{" "}
+              Upload files from the{" "}
+              <Link href="/" className="font-medium underline underline-offset-2">
+                Onboarding Home
+              </Link>
+              .
+            </CardDescription>
           </CardHeader>
-          <CardContent>
-            <pre className="overflow-auto rounded-md bg-muted/40 p-3 text-xs">
-              {typeof error === "string"
-                ? error
-                : JSON.stringify(error, null, 2)}
-            </pre>
+          <CardContent className="flex flex-col gap-3">
+            {(section === "plan-details" ? planPdfs : censusFiles).length ===
+              0 && (
+              <p className="text-sm text-muted-foreground">
+                No {section === "plan-details" ? "plan PDF" : "census CSV"}{" "}
+                uploaded yet.
+              </p>
+            )}
+            {(section === "plan-details" ? planPdfs : censusFiles).map((f) => (
+              <div
+                key={f.id}
+                className="flex items-center justify-between gap-4 rounded-md border border-foreground/10 bg-muted/30 px-3 py-2 text-sm"
+              >
+                <div className="flex flex-col">
+                  <span className="font-mono">{f.filename}</span>
+                  <span className="text-xs text-muted-foreground">
+                    {new Date(f.uploaded_at).toLocaleString()}
+                    {f.size_bytes != null ? ` · ${f.size_bytes} bytes` : ""}
+                  </span>
+                </div>
+                {section === "plan-details" && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={() => handleExtract(f.id)}
+                    disabled={running !== null}
+                  >
+                    {running === f.id ? "Extracting…" : "Run extraction"}
+                  </Button>
+                )}
+                {section === "participants" && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={() => handleImport(f.id)}
+                    disabled={running !== null}
+                  >
+                    {running === f.id ? "Importing…" : "Run import"}
+                  </Button>
+                )}
+              </div>
+            ))}
           </CardContent>
         </Card>
       )}
 
-      {latest && <LatestRunCard run={latest} />}
+      {error &&
+        (section === "plan-details" ||
+          section === "participants" ||
+          section === "payroll-runs") && (
+          <Card>
+            <CardHeader>
+              <CardTitle>Agent error</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <pre className="overflow-auto rounded-md bg-muted/40 p-3 text-xs">
+                {typeof error === "string"
+                  ? error
+                  : JSON.stringify(error, null, 2)}
+              </pre>
+            </CardContent>
+          </Card>
+        )}
 
-      {/*
-        `key` makes the form remount whenever a new extraction lands.
-        That re-runs `useState(toFormState(...))` with the fresh agent
-        output instead of keeping the previous form values around -- the
-        React-19-correct way to re-seed state on prop change without
-        useEffect (avoids `react-hooks/set-state-in-effect`).
-      */}
-      <ExtractedFieldsCard
-        key={`${plan.id}:${plan.extraction_status}:${plan.extracted_at ?? "_"}`}
-        plan={plan}
-      />
+      {showLatest && latest && <LatestRunCard run={latest} />}
 
-      {pendingMapping && (
-        // Same re-mount-on-id trick as ExtractedFieldsCard: whenever the
-        // pending row's identity changes (new agent proposal landed, or
-        // the prior one was approved/rejected and a new one appeared),
-        // wipe form state so we never show stale CSV column values
-        // bound to a different mapping row.
+      {section === "plan-details" && (
+        <ExtractedFieldsCard
+          key={`${plan.id}:${plan.extraction_status}:${plan.extracted_at ?? "_"}`}
+          plan={plan}
+        />
+      )}
+
+      {section === "payroll-mapping" && pendingMapping && (
         <ProposedMappingCard
           key={pendingMapping.id}
           plan={plan}
@@ -550,31 +526,79 @@ export function PlanDetailClient({
         />
       )}
 
-      <PayrollRunsTable
-        plan={plan}
-        files={files}
-        payrollRuns={payrollRuns}
-        pendingMapping={pendingMapping}
-        approvedMapping={approvedMapping}
-        running={running}
-        onMap={handleMap}
-        onReconcile={handleReconcile}
-      />
-
-      <ReconciliationIssuesCard
-        plan={plan}
-        issues={issues}
-        fixesByIssueId={fixesByIssueId}
-        payrollRuns={payrollRuns}
-      />
-
-      {approvedMapping && (
+      {section === "payroll-mapping" && approvedMapping && (
         <ApprovedMappingCard mapping={approvedMapping} />
       )}
 
-      <AuditTrailCard auditLogs={auditLogs} />
+      {section === "payroll-mapping" && !pendingMapping && !approvedMapping && (
+        <Card>
+          <CardContent className="py-8 text-center text-sm text-muted-foreground">
+            No mapping yet. Upload Payroll Run 1 and map it from the{" "}
+            <Link
+              href={`/plans/${plan.id}/payroll-runs`}
+              className="font-medium underline underline-offset-2"
+            >
+              Payroll Runs
+            </Link>{" "}
+            section.
+          </CardContent>
+        </Card>
+      )}
 
-      <ParticipantsCard participants={participants} />
+      {section === "payroll-runs" && (
+        <>
+          {payrollFiles.length === 0 && (
+            <Card>
+              <CardContent className="py-6 text-sm text-muted-foreground">
+                No payroll CSVs yet. Upload{" "}
+                <span className="font-mono">payroll_run</span> files from the{" "}
+                <Link href="/" className="font-medium underline underline-offset-2">
+                  Onboarding Home
+                </Link>
+                .
+              </CardContent>
+            </Card>
+          )}
+          <PayrollRunsTable
+            plan={plan}
+            files={files}
+            payrollRuns={payrollRuns}
+            pendingMapping={pendingMapping}
+            approvedMapping={approvedMapping}
+            running={running}
+            onMap={handleMap}
+            onReconcile={handleReconcile}
+          />
+        </>
+      )}
+
+      {section === "issues" && (
+        <>
+          {issues.length === 0 ? (
+            <Card>
+              <CardContent className="py-8 text-center text-sm text-muted-foreground">
+                No reconciliation issues yet. Run reconciliation on a mapped
+                payroll run first.
+              </CardContent>
+            </Card>
+          ) : (
+            <ReconciliationIssuesCard
+              plan={plan}
+              issues={issues}
+              fixesByIssueId={fixesByIssueId}
+              payrollRuns={payrollRuns}
+            />
+          )}
+        </>
+      )}
+
+      {section === "audit-trail" && <AuditTrailCard auditLogs={auditLogs} />}
+
+      {section === "assistant" && <AssistantCard plan={plan} />}
+
+      {section === "participants" && (
+        <ParticipantsCard participants={participants} />
+      )}
     </>
   );
 }
@@ -2630,6 +2654,151 @@ function AuditTrailCard({ auditLogs }: { auditLogs: PlanDetailAuditLog[] }) {
             </TableBody>
           </Table>
         )}
+      </CardContent>
+    </Card>
+  );
+}
+// ---------------------------------------------------------------------------
+// Onboarding Assistant — read-only Q&A over plan state.
+// ---------------------------------------------------------------------------
+
+type AssistantMessage = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+type AssistantToolCall = { name: string; ok: boolean };
+
+type AssistantResponse = {
+  reply: string;
+  stop_reason: string | null;
+  iterations: number;
+  tool_calls: AssistantToolCall[];
+  audit_log_id: string;
+};
+
+function AssistantCard({ plan }: { plan: PlanDetailPlan }) {
+  const [messages, setMessages] = useState<AssistantMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [lastToolCalls, setLastToolCalls] = useState<AssistantToolCall[]>(
+    [],
+  );
+
+  async function handleSend(e: React.FormEvent) {
+    e.preventDefault();
+    const trimmed = input.trim();
+    if (!trimmed || loading) return;
+
+    const userTurn: AssistantMessage = { role: "user", content: trimmed };
+    const nextMessages = [...messages, userTurn];
+    setMessages(nextMessages);
+    setInput("");
+    setLoading(true);
+    setError(null);
+    setLastToolCalls([]);
+
+    try {
+      const res = await fetch(`/api/plans/${plan.id}/assistant`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          message: trimmed,
+          history: messages,
+        }),
+      });
+      const body = (await res.json().catch(() => ({}))) as
+        | AssistantResponse
+        | { error?: string; message?: string };
+
+      if (!res.ok) {
+        setError(
+          ("message" in body && body.message) ||
+            ("error" in body && body.error) ||
+            `Assistant request failed (${res.status})`,
+        );
+        return;
+      }
+
+      const data = body as AssistantResponse;
+      setMessages([
+        ...nextMessages,
+        { role: "assistant", content: data.reply },
+      ]);
+      setLastToolCalls(data.tool_calls ?? []);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Assistant failed");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Onboarding assistant</CardTitle>
+        <CardDescription>
+          Ask about extracted plan details, participants, open issues, or
+          what changed in the audit trail. Read-only — fixes still require
+          your approval in the UI.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-4">
+        {messages.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            Try: &quot;What plan details were extracted?&quot; or
+            &quot;What reconciliation issues are still open?&quot;
+          </p>
+        ) : (
+          <div className="flex max-h-80 flex-col gap-3 overflow-y-auto rounded-md border p-3">
+            {messages.map((msg, idx) => (
+              <div
+                key={`${idx}-${msg.role}`}
+                className={
+                  msg.role === "user"
+                    ? "ml-8 rounded-md bg-muted px-3 py-2 text-sm"
+                    : "mr-8 rounded-md border px-3 py-2 text-sm"
+                }
+              >
+                <span className="mb-1 block text-xs font-medium text-muted-foreground">
+                  {msg.role === "user" ? "You" : "Assistant"}
+                </span>
+                <p className="whitespace-pre-wrap">{msg.content}</p>
+              </div>
+            ))}
+            {loading && (
+              <p className="text-sm text-muted-foreground">Thinking…</p>
+            )}
+          </div>
+        )}
+
+        {lastToolCalls.length > 0 && (
+          <div className="flex flex-wrap gap-2">
+            {lastToolCalls.map((tc) => (
+              <Badge key={tc.name} variant={tc.ok ? "secondary" : "destructive"}>
+                {tc.name} {tc.ok ? "ok" : "err"}
+              </Badge>
+            ))}
+          </div>
+        )}
+
+        {error && (
+          <p className="text-sm text-destructive">{error}</p>
+        )}
+
+        <form onSubmit={handleSend} className="flex gap-2">
+          <Input
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            placeholder="Ask about this plan…"
+            disabled={loading}
+            aria-label="Assistant message"
+          />
+          <Button type="submit" disabled={loading || !input.trim()}>
+            {loading ? "Sending…" : "Send"}
+          </Button>
+        </form>
       </CardContent>
     </Card>
   );

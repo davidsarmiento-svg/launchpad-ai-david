@@ -32,14 +32,14 @@ MVP demo flow, and later stretch goals. Current status:
 
 | Training module | Current status | Notes |
 |---|---|---|
-| Onboarding Home | **Partial** | Home page can create/list plans and upload files, but still needs a true onboarding status overview / dashboard metrics. |
-| Plan Details | **MVP done** | PDF upload, Plan Extraction Agent, extracted-field review/edit, approve/reject, and audit rows are implemented. |
-| Participant Data | **MVP done** | Census upload/import is implemented; normalized participants render in the plan detail UI. Census data-quality issues currently live in `audit_logs`. |
-| Payroll Mapping | **MVP done** | Run 1 mapping agent proposes a mapping; user approves; later matching runs auto-apply the approved mapping. |
-| Payroll Runs | **MVP done** | All 5 demo runs upload + auto-map + reconcile end-to-end. |
-| Reconciliation Issues | **MVP done** | Phase 9.1 runner/routes/UI committed in `b14307e`; verified end-to-end across all 5 demo CSVs. See §4.14. |
-| Change Logs / Audit Trail | **MVP done** | `listAuditLogsForPlan` + `<AuditTrailCard>` on plan detail; chronological ledger of user/agent/system actions. See §4.15. |
-| AI Onboarding Assistant | **Not started** | Planned as Phase 9.2 after reconciliation; will reuse the existing tool registry and data-access layer. |
+| Onboarding Home | **MVP done** | `/` shows plan status cards (participants, runs, issues, mapping) + upload sidebar. Links into 7 plan sections. |
+| Plan Details | **MVP done** | `/plans/[id]/plan-details` — PDF list, extraction, field review. |
+| Participant Data | **MVP done** | `/plans/[id]/participants` — census import + roster table. |
+| Payroll Mapping | **MVP done** | `/plans/[id]/payroll-mapping` — pending/approved mapping cards. |
+| Payroll Runs | **MVP done** | `/plans/[id]/payroll-runs` — runs table with Map / Reconcile. |
+| Reconciliation Issues | **MVP done** | `/plans/[id]/issues` — triage + approve/reject fixes. |
+| Change Logs / Audit Trail | **MVP done** | `/plans/[id]/audit-trail` — chronological ledger. |
+| AI Onboarding Assistant | **MVP done** | `/plans/[id]/assistant` — read-only chat. See §4.16. |
 
 Agent coverage:
 
@@ -49,7 +49,7 @@ Agent coverage:
 | Payroll Mapping Agent | **Done** | Uses `skills/payroll-mapping/SKILL.md`, proposes pending mappings, and requires user approval. |
 | Participant Import Agent | **Done** | Uses `skills/participant-import/SKILL.md`; imports normalized participants and flags census issues into audit logs. |
 | Payroll Reconciliation Agent | **MVP done** | Committed in Phase 9.1 (`b14307e`). See §4.14. |
-| Onboarding Assistant Agent | **Not started** | Build after audit trail is committed; will reuse the existing tool registry and data-access layer. |
+| Onboarding Assistant Agent | **MVP done** | Four read-only tools; multi-turn chat. See §4.16. |
 
 MVP coverage:
 
@@ -62,7 +62,7 @@ MVP coverage:
 | Display reconciliation issues with suggested fixes | **Done** — `ReconciliationIssuesCard` renders open + resolved issues with inline Approve / Reject / Mark resolved / Ignore controls. |
 | User approval gate before any fix is applied | **Done** — `PATCH /suggested-fixes/[id]` atomically approves + applies under optimistic concurrency; agent never writes to data tables. Verified across `payroll_record.update` (Runs 2/4) and `participant.create_from_payroll` (Run 4 E031). |
 | Audit log visible in the dashboard | **Done** — `<AuditTrailCard>` on plan detail; see §4.15. |
-| AI assistant that answers basic questions using tools | **Not started** |
+| AI assistant that answers basic questions using tools | **Done** — `/plans/[id]/assistant`; see §4.16. |
 
 Stretch goals stay secondary:
 
@@ -72,8 +72,8 @@ Stretch goals stay secondary:
 - Assistant chat history: after the assistant itself works.
 - PDF export: last, only if the MVP is stable.
 
-Demo-day success now depends on building the Onboarding Assistant,
-applying prod migrations, and redeploying the current app to Vercel.
+Demo-day success now depends on pushing to origin, applying prod
+migrations, and redeploying the current app to Vercel.
 
 ---
 
@@ -102,7 +102,8 @@ Before writing any code, read these in this order:
 ## 3. Current commit graph + worktree
 
 ```text
-(HEAD)  Audit Trail UI
+(HEAD)  Phase 9.2: Onboarding Assistant + 8-section dashboard
+c116536 Add Audit Trail UI on plan detail page
 b14307e Phase 9.1: Payroll Reconciliation Agent
 c8c8916 Phase 9.0: Payroll Mapping Agent
 e858218 docs: update handoff for Phases 5/6/7/7.5/8 commits
@@ -119,10 +120,9 @@ c4b7cdb Session 3 scaffold: UI kit, theme, hello API route, deployment guide
 f01795d Initial scaffold: Next.js + shadcn
 ```
 
-Branch `main` is **9 commits ahead** of `origin/main` at
+Branch `main` is **10 commits ahead** of `origin/main` at
 https://github.com/davidsarmiento-svg/launchpad-ai-david — push when
-ready. Phase 9.1 and Audit Trail UI are committed. All phases have
-lint + build clean.
+ready. All MVP phases through 9.2 are committed. Lint + build clean.
 
 End-to-end signals against launchpad-dev:
 
@@ -970,6 +970,42 @@ Placement: after Approved Mapping, before Participants — the trail
 spans the full onboarding lifecycle and reads top-to-bottom as a
 timeline.
 
+### 4.16 Phase 9.2 — Onboarding Assistant + 8-section dashboard
+
+Read-only conversational agent plus training-brief dashboard layout:
+eight distinct modules (home + seven plan sections) with sidebar nav.
+
+**Read-only tools** (`lib/server/tools/registry.ts`):
+
+- `get_plan_details` — plan identity, extraction status, extracted_fields
+- `get_participants` — census roster with optional search/limit
+- `list_reconciliation_issues` — issues with optional status/run filter
+- `list_audit_logs` — chronological audit rows scoped to the plan
+
+**Runner extension** (`lib/server/agents/run.ts`):
+
+- `conversation?: MessageParam[]` for multi-turn chat
+- `extractAssistantText()` helper for the final prose reply
+
+**API** (`POST /api/plans/[id]/assistant`):
+
+- Body: `{ message, history?, user_name? }`
+- Audits: `CHAT_QUESTION_ASKED` (user) + `MCP_TOOL_CALLED` (per tool)
+- Returns: `{ reply, stop_reason, iterations, tool_calls, audit_log_id }`
+
+**Skill** (`skills/onboarding-assistant/SKILL.md`):
+
+- Instructs tool-first answers; refuses to claim it applied fixes
+
+**UI** (`components/plan-detail-client.tsx` + plan dashboard shell):
+
+- `<AssistantCard>` at `/plans/[id]/assistant`
+- **8-section layout**: `app/plans/[id]/layout.tsx` sidebar +
+  `app/plans/[id]/[section]/page.tsx` routes; Onboarding Home at `/`
+  with `listPlanOnboardingSummaries` status cards
+- Section slugs in `lib/plan-dashboard-sections.ts`; shared data via
+  `loadPlanDashboard` in layout
+
 ---
 
 ## 5. Schema design — quick reference
@@ -1273,24 +1309,16 @@ Shipped. Full details in §4.15. Plan detail now renders a
 chronological audit ledger covering plan creation, uploads, agent
 runs, reconciliation, and fix approval/apply chains.
 
-### 7.11 Phase 9.2 — Onboarding Assistant (NEXT)
+### 7.11 Phase 9.2 — Onboarding Assistant + dashboard (DONE)
 
-Conversational agent that walks the operator through the full
-onboarding flow. Reuses skills, tools, and approval-card patterns
-from Phases 7/7.5/8/9.0/9.1. Will introduce read-only tools
-(`get_plan_details`, `get_participants`, `list_reconciliation_issues`,
-`list_audit_logs`) so the assistant can answer "what changed?"
-questions without mutating data. The non-negotiable rule from
-§4.14 applies here too: even when the user asks the assistant to
-"fix this", the assistant must surface a `suggested_fix` card and
-wait for explicit approval before invoking the apply pipeline.
+Shipped. Full details in §4.16.
 
 ### 7.12 Eventually: production deploy alignment
 - Reconnect GitHub in the Vercel dashboard so pushes auto-deploy.
 - Apply migrations to launchpad-prod (now six: audit_logs, domain
   schema, storage bucket, payroll_mappings rejected status, Phase 9.1
   plan-scope issue migration, Phase 9.1 related-issue migration).
-- Push all nine commits to `origin/main` (`git push`) once ready.
+- Push all ten commits to `origin/main` (`git push`) once ready.
 - Run the smoke tests from
   [docs/deployment-and-production-readiness.md §End-To-End Pre-Launch Checklist](deployment-and-production-readiness.md).
 - Turn off Vercel deployment protection if the demo URL should be

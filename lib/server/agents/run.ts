@@ -63,8 +63,17 @@ export type RunAgentInput = {
   skill: string;
   /** Tool names from `lib/server/tools/registry`. */
   tool_names: ReadonlyArray<string>;
-  /** Initial user message (often text + a document block). */
-  user_message: AgentMessage["content"];
+  /**
+   * Initial user message (text + optional documents/images). Required
+   * unless `conversation` is supplied.
+   */
+  user_message?: AgentMessage["content"];
+  /**
+   * Full message history for multi-turn agents (e.g. the onboarding
+   * assistant). When set, `user_message` is ignored and this array is
+   * used as the starting conversation.
+   */
+  conversation?: Array<MessageParam>;
   /**
    * Identifier written into every audit row this run produces.
    * e.g. "plan-extraction-agent".
@@ -92,11 +101,16 @@ export async function runAgent(input: RunAgentInput): Promise<RunAgentResult> {
     skill,
     tool_names,
     user_message,
+    conversation: seedConversation,
     actor_name,
     model = DEFAULT_MODEL,
     max_tokens = 4096,
     max_iterations = 8,
   } = input;
+
+  if (!seedConversation && !user_message) {
+    throw new Error("runAgent requires user_message or conversation");
+  }
 
   const system = await loadSkill(skill);
   const tools = getToolsForClaude(tool_names);
@@ -104,8 +118,8 @@ export async function runAgent(input: RunAgentInput): Promise<RunAgentResult> {
 
   const anthropic = getAnthropicClient();
 
-  const conversation: Array<MessageParam> = [
-    { role: "user", content: user_message },
+  const conversation: Array<MessageParam> = seedConversation ?? [
+    { role: "user", content: user_message! },
   ];
   const tool_calls: Array<AgentToolCallRecord> = [];
   let lastStopReason: string | null = null;
@@ -200,3 +214,16 @@ export async function runAgent(input: RunAgentInput): Promise<RunAgentResult> {
     tool_calls,
   };
 }
+
+/** Concatenate text blocks from a final assistant turn. */
+export function extractAssistantText(
+  content: Array<ContentBlock>,
+): string {
+  return content
+    .filter((block): block is Extract<TextBlock, { type: "text" }> => block.type === "text")
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+}
+
+type TextBlock = Extract<ContentBlock, { type: "text" }>;

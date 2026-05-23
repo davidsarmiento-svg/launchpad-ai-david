@@ -2,30 +2,39 @@ import "server-only";
 
 import { z } from "zod";
 
-import { auditLogInputSchema, writeAuditLog } from "@/lib/server/audit-log";
+import { auditLogInputSchema, listAuditLogsForPlan, writeAuditLog } from "@/lib/server/audit-log";
 import { DataLayerError } from "@/lib/server/errors";
+import { listFilesForPlan } from "@/lib/server/files";
 import {
   importParticipants,
   importParticipantsInputSchema,
+  listParticipants,
 } from "@/lib/server/participants";
 import {
   payrollMappingProposalJsonSchema,
   payrollMappingProposalSchema,
 } from "@/lib/server/payroll-mapping";
 import { proposeMapping } from "@/lib/server/payroll-mappings";
+import { listPayrollRunsForPlan } from "@/lib/server/payroll-runs";
 import {
   extractedPlanFieldsJsonSchema,
   extractedPlanFieldsSchema,
 } from "@/lib/server/plan-extraction";
-import { updateExtractedFields } from "@/lib/server/plans";
+import { getPlan, updateExtractedFields } from "@/lib/server/plans";
 import {
   reconciliationIssueInputSchema,
   reconciliationIssueJsonSchema,
   suggestedFixInputSchema,
   suggestedFixJsonSchema,
 } from "@/lib/server/reconciliation";
-import { createReconciliationIssue } from "@/lib/server/reconciliation-issues";
-import { createSuggestedFix } from "@/lib/server/suggested-fixes";
+import {
+  createReconciliationIssue,
+  listIssuesForPlan,
+} from "@/lib/server/reconciliation-issues";
+import {
+  createSuggestedFix,
+  listSuggestedFixesForIssue,
+} from "@/lib/server/suggested-fixes";
 
 /**
  * Tool registry for the Claude tool-use loop.
@@ -1061,6 +1070,290 @@ const flagReconciliationObservation: ToolDefinition<FlagReconciliationObservatio
 };
 
 // ---------------------------------------------------------------------------
+// Read-only tools for the Onboarding Assistant (Phase 9.2)
+// ---------------------------------------------------------------------------
+
+const getPlanDetailsInputSchema = z.object({
+  plan_id: z.string().uuid(),
+});
+
+type GetPlanDetailsInput = z.infer<typeof getPlanDetailsInputSchema>;
+
+const getPlanDetails: ToolDefinition<GetPlanDetailsInput> = {
+  name: "get_plan_details",
+  description:
+    "Read the current plan record: identity, status, extraction_status, " +
+    "and the full extracted_fields jsonb. Read-only — never mutates data.",
+  inputJsonSchema: {
+    type: "object",
+    properties: {
+      plan_id: { type: "string", description: "uuid of the plans row." },
+    },
+    required: ["plan_id"],
+    additionalProperties: false,
+  },
+  inputSchema: getPlanDetailsInputSchema,
+  async handler(input) {
+    try {
+      const plan = await getPlan(input.plan_id);
+      if (!plan) {
+        return { ok: false, error: `no plans row with id ${input.plan_id}` };
+      }
+      return {
+        ok: true,
+        data: {
+          id: plan.id,
+          employer_name: plan.employer_name,
+          plan_name: plan.plan_name,
+          plan_year: plan.plan_year,
+          status: plan.status,
+          extraction_status: plan.extraction_status,
+          extracted_at: plan.extracted_at,
+          extracted_fields: plan.extracted_fields,
+          created_at: plan.created_at,
+          updated_at: plan.updated_at,
+        },
+      };
+    } catch (err) {
+      if (err instanceof DataLayerError) {
+        return { ok: false, error: err.message };
+      }
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  },
+};
+
+const getParticipantsInputSchema = z.object({
+  plan_id: z.string().uuid(),
+  search: z.string().min(1).optional(),
+  limit: z.number().int().positive().max(200).default(50),
+});
+
+type GetParticipantsInput = z.infer<typeof getParticipantsInputSchema>;
+
+const getParticipants: ToolDefinition<GetParticipantsInput> = {
+  name: "get_participants",
+  description:
+    "List normalized census participants for a plan. Optional search " +
+    "matches employee_id, participant_id, or name prefix. Read-only.",
+  inputJsonSchema: {
+    type: "object",
+    properties: {
+      plan_id: { type: "string" },
+      search: {
+        type: "string",
+        description: "Optional prefix search across id and name fields.",
+      },
+      limit: {
+        type: "integer",
+        minimum: 1,
+        maximum: 200,
+        description: "Max rows to return (default 50).",
+      },
+    },
+    required: ["plan_id"],
+    additionalProperties: false,
+  },
+  inputSchema: getParticipantsInputSchema,
+  async handler(input) {
+    try {
+      const rows = await listParticipants({
+        plan_id: input.plan_id,
+        search: input.search,
+        limit: input.limit,
+      });
+      return {
+        ok: true,
+        data: {
+          count: rows.length,
+          participants: rows.map((p) => ({
+            employee_id: p.employee_id,
+            participant_id: p.participant_id,
+            first_name: p.first_name,
+            last_name: p.last_name,
+            email: p.email,
+            eligibility_status: p.eligibility_status,
+            current_deferral_rate: p.current_deferral_rate,
+            account_balance: p.account_balance,
+            employment_status: p.employment_status,
+          })),
+        },
+      };
+    } catch (err) {
+      if (err instanceof DataLayerError) {
+        return { ok: false, error: err.message };
+      }
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  },
+};
+
+const listReconciliationIssuesInputSchema = z.object({
+  plan_id: z.string().uuid(),
+  status: z.enum(["open", "resolved", "ignored"]).optional(),
+  payroll_run_id: z.string().uuid().optional(),
+});
+
+type ListReconciliationIssuesInput = z.infer<
+  typeof listReconciliationIssuesInputSchema
+>;
+
+const listReconciliationIssues: ToolDefinition<ListReconciliationIssuesInput> =
+  {
+    name: "list_reconciliation_issues",
+    description:
+      "List reconciliation issues for a plan. Optional filters: status " +
+      "(open/resolved/ignored) and payroll_run_id. Read-only.",
+    inputJsonSchema: {
+      type: "object",
+      properties: {
+        plan_id: { type: "string" },
+        status: {
+          type: "string",
+          enum: ["open", "resolved", "ignored"],
+        },
+        payroll_run_id: {
+          type: "string",
+          description: "Optional uuid to scope to one payroll run.",
+        },
+      },
+      required: ["plan_id"],
+      additionalProperties: false,
+    },
+    inputSchema: listReconciliationIssuesInputSchema,
+    async handler(input) {
+      try {
+        let issues = await listIssuesForPlan(input.plan_id);
+        if (input.status) {
+          issues = issues.filter((i) => i.status === input.status);
+        }
+        if (input.payroll_run_id) {
+          issues = issues.filter(
+            (i) => i.payroll_run_id === input.payroll_run_id,
+          );
+        }
+        return {
+          ok: true,
+          data: {
+            count: issues.length,
+            issues: issues.map((i) => ({
+              id: i.id,
+              payroll_run_id: i.payroll_run_id,
+              category: i.category,
+              severity: i.severity,
+              code: i.code,
+              status: i.status,
+              description: i.description,
+              agent_explanation: i.agent_explanation,
+              field_name: i.field_name,
+              expected_value: i.expected_value,
+              actual_value: i.actual_value,
+              created_at: i.created_at,
+              resolved_at: i.resolved_at,
+            })),
+          },
+        };
+      } catch (err) {
+        if (err instanceof DataLayerError) {
+          return { ok: false, error: err.message };
+        }
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    },
+  };
+
+const listAuditLogsInputSchema = z.object({
+  plan_id: z.string().uuid(),
+  limit: z.number().int().positive().max(100).default(50),
+});
+
+type ListAuditLogsInput = z.infer<typeof listAuditLogsInputSchema>;
+
+const listAuditLogs: ToolDefinition<ListAuditLogsInput> = {
+  name: "list_audit_logs",
+  description:
+    "Read recent audit-log rows scoped to this plan (chronological, " +
+    "oldest first). Use to answer what changed, who acted, and when. " +
+    "Read-only.",
+  inputJsonSchema: {
+    type: "object",
+    properties: {
+      plan_id: { type: "string" },
+      limit: {
+        type: "integer",
+        minimum: 1,
+        maximum: 100,
+        description: "Max rows (default 50).",
+      },
+    },
+    required: ["plan_id"],
+    additionalProperties: false,
+  },
+  inputSchema: listAuditLogsInputSchema,
+  async handler(input) {
+    try {
+      const [runs, files, issues] = await Promise.all([
+        listPayrollRunsForPlan(input.plan_id),
+        listFilesForPlan(input.plan_id),
+        listIssuesForPlan(input.plan_id),
+      ]);
+      const fixLists = await Promise.all(
+        issues.map((i) => listSuggestedFixesForIssue(i.id)),
+      );
+
+      const rows = await listAuditLogsForPlan({
+        plan_id: input.plan_id,
+        payroll_run_ids: runs.map((r) => r.id),
+        file_ids: files.map((f) => f.id),
+        reconciliation_issue_ids: issues.map((i) => i.id),
+        suggested_fix_ids: fixLists.flat().map((f) => f.id),
+        limit: input.limit,
+      });
+
+      return {
+        ok: true,
+        data: {
+          count: rows.length,
+          audit_logs: rows.map((r) => ({
+            id: r.id,
+            timestamp: r.timestamp,
+            actor_type: r.actor_type,
+            actor_name: r.actor_name,
+            action: r.action,
+            entity_type: r.entity_type,
+            entity_id: r.entity_id,
+            payroll_run_id: r.payroll_run_id,
+            employee_id: r.employee_id,
+            field_name: r.field_name,
+            before_value: r.before_value,
+            after_value: r.after_value,
+            reason: r.reason,
+            status: r.status,
+          })),
+        },
+      };
+    } catch (err) {
+      if (err instanceof DataLayerError) {
+        return { ok: false, error: err.message };
+      }
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
@@ -1073,6 +1366,10 @@ const ALL_TOOLS = [
   flagMappingIssue,
   proposeReconciliationIssue,
   flagReconciliationObservation,
+  getPlanDetails,
+  getParticipants,
+  listReconciliationIssues,
+  listAuditLogs,
 ] as const;
 
 const TOOLS_BY_NAME: Record<string, ToolDefinition<unknown>> =

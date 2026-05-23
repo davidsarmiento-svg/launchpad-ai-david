@@ -1,6 +1,13 @@
 import Image from "next/image";
 
 import { HelloButton } from "@/components/hello-button";
+import { UploadCard } from "@/components/upload-card";
+
+// `UploadCard` reads the live plans list from Supabase at render time,
+// so the page must render dynamically on every request. Without this,
+// Next.js 16 prerenders the home page at build time and visitors see a
+// stale snapshot (and the build itself fails offline).
+export const dynamic = "force-dynamic";
 
 export default function Home() {
   return (
@@ -37,6 +44,7 @@ export default function Home() {
           </p>
         </div>
         <HelloButton />
+        <UploadCard />
         <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
           <a
             className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"

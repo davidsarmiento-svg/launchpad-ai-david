@@ -1,0 +1,116 @@
+import { z } from "zod";
+
+import { writeAuditLog } from "@/lib/server/audit-log";
+import { toErrorResponse } from "@/lib/server/http";
+import { uploadFile } from "@/lib/server/storage";
+
+export const dynamic = "force-dynamic";
+
+/**
+ * POST /api/upload
+ *
+ * Multipart upload entry point used by the Upload card on the home
+ * page. Expects form fields:
+ *   - file        : File   (required)
+ *   - plan_id     : uuid   (required, the plan the file belongs to)
+ *   - kind        : enum   (required: participant_census | payroll_run | other)
+ *   - uploaded_by : string (optional, defaults to "system_demo_user")
+ *
+ * Note on `plan_pdf`: this endpoint deliberately does NOT accept
+ * `plan_pdf`. The Phase 7 Plan Extraction Agent flow needs to bootstrap
+ * a plan row + run an LLM round-trip, which has a totally different
+ * latency shape from a bytes-only upload, so it gets its own endpoint.
+ *
+ * Behavior:
+ *   1. Stream the upload through `uploadFile` (sha256 + idempotent
+ *      registerUpload + Storage push + back-write storage_path).
+ *   2. Write an audit-log row tagged with the actor, action, entity
+ *      ids, and a {filename, sha256, size_bytes, created} after_value
+ *      so the Audit Trail can show exactly what landed.
+ *   3. Return the file row + audit-log id + a `created` flag so the
+ *      UI can show "uploaded" vs "already present".
+ */
+
+const uploadFormSchema = z.object({
+  plan_id: z.string().uuid("plan_id must be a valid uuid"),
+  kind: z.enum(["participant_census", "payroll_run", "other"]),
+  uploaded_by: z.string().min(1).max(255).optional(),
+});
+
+export async function POST(request: Request) {
+  try {
+    let form: FormData;
+    try {
+      form = await request.formData();
+    } catch (err) {
+      return Response.json(
+        {
+          error: "invalid_request",
+          message: `expected multipart/form-data: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        },
+        { status: 400 },
+      );
+    }
+
+    const fileEntry = form.get("file");
+    if (!(fileEntry instanceof File)) {
+      return Response.json(
+        {
+          error: "invalid_request",
+          message: "missing form field 'file'",
+        },
+        { status: 400 },
+      );
+    }
+
+    const fields = uploadFormSchema.parse({
+      plan_id: form.get("plan_id"),
+      kind: form.get("kind"),
+      uploaded_by: form.get("uploaded_by") ?? undefined,
+    });
+
+    const bytes = new Uint8Array(await fileEntry.arrayBuffer());
+
+    const { file, created } = await uploadFile({
+      plan_id: fields.plan_id,
+      kind: fields.kind,
+      filename: fileEntry.name,
+      mime_type: fileEntry.type || undefined,
+      uploaded_by: fields.uploaded_by ?? "system_demo_user",
+      bytes,
+    });
+
+    const audit = await writeAuditLog({
+      actor_type: "user",
+      actor_name: fields.uploaded_by ?? "system_demo_user",
+      action: created ? "FILE_UPLOADED" : "FILE_UPLOAD_DEDUPED",
+      entity_type: "file",
+      entity_id: file.id,
+      after_value: {
+        plan_id: file.plan_id,
+        filename: file.filename,
+        kind: file.kind,
+        size_bytes: file.size_bytes,
+        sha256: file.checksum_sha256,
+        storage_path: file.storage_path,
+        created,
+      },
+      reason: created
+        ? "New file uploaded via POST /api/upload"
+        : "Re-upload of identical bytes - returned existing files row",
+    });
+
+    return Response.json(
+      {
+        file,
+        created,
+        audit_log_id: audit.id,
+      },
+      { status: created ? 201 : 200 },
+    );
+  } catch (err) {
+    return toErrorResponse(err);
+  }
+}

@@ -22,9 +22,16 @@ export async function GET() {
   let supabaseStatus: CheckStatus = "ok";
   let supabaseError: string | null = null;
 
+  // We ping audit_logs (rather than auth.admin.listUsers) because that
+  // table is the spine of the app. A successful HEAD count proves
+  // (a) the URL is right, (b) the service-role key is right, AND
+  // (c) the migrations are applied -- a truer "the schema is deployed"
+  // signal. `head: true` skips returning rows; only the count comes back.
   try {
     const supabase = getSupabaseServiceRoleClient();
-    const { error } = await supabase.auth.admin.listUsers({ perPage: 1 });
+    const { error } = await supabase
+      .from("audit_logs")
+      .select("*", { count: "exact", head: true });
     if (error) {
       supabaseStatus = "error";
       supabaseError = error.message;

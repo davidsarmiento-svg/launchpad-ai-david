@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
@@ -45,7 +46,11 @@ type UploadResponse = {
   audit_log_id: string;
 };
 
-type UploadKind = "participant_census" | "payroll_run" | "other";
+type UploadKind =
+  | "plan_pdf"
+  | "participant_census"
+  | "payroll_run"
+  | "other";
 
 export function UploadCardClient({
   initialPlans,
@@ -180,6 +185,7 @@ export function UploadCardClient({
             onChange={(e) => setKind(e.target.value as UploadKind)}
             className="rounded-md border border-input bg-background px-3 py-2 text-sm"
           >
+            <option value="plan_pdf">plan_pdf</option>
             <option value="participant_census">participant_census</option>
             <option value="payroll_run">payroll_run</option>
             <option value="other">other</option>
@@ -192,7 +198,11 @@ export function UploadCardClient({
           </label>
           <Input
             type="file"
-            accept=".csv,text/csv,application/csv"
+            accept={
+              kind === "plan_pdf"
+                ? ".pdf,application/pdf"
+                : ".csv,text/csv,application/csv"
+            }
             onChange={(e) => setFile(e.target.files?.[0] ?? null)}
           />
         </div>
@@ -231,6 +241,14 @@ export function UploadCardClient({
               <dt className="text-muted-foreground">audit_log_id</dt>
               <dd className="truncate">{result.audit_log_id}</dd>
             </dl>
+            {result.file.plan_id && (
+              <Link
+                href={`/plans/${result.file.plan_id}`}
+                className="self-start text-xs underline"
+              >
+                Open plan detail →
+              </Link>
+            )}
           </div>
         )}
       </CardContent>

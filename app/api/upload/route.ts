@@ -13,13 +13,14 @@ export const dynamic = "force-dynamic";
  * page. Expects form fields:
  *   - file        : File   (required)
  *   - plan_id     : uuid   (required, the plan the file belongs to)
- *   - kind        : enum   (required: participant_census | payroll_run | other)
+ *   - kind        : enum   (required: plan_pdf | participant_census | payroll_run | other)
  *   - uploaded_by : string (optional, defaults to "system_demo_user")
  *
- * Note on `plan_pdf`: this endpoint deliberately does NOT accept
- * `plan_pdf`. The Phase 7 Plan Extraction Agent flow needs to bootstrap
- * a plan row + run an LLM round-trip, which has a totally different
- * latency shape from a bytes-only upload, so it gets its own endpoint.
+ * Note on `plan_pdf`: this endpoint accepts the upload itself but does
+ * NOT trigger extraction. The Plan Extraction Agent runs on a separate
+ * call to POST /api/plans/[id]/extract once the file is in Storage.
+ * Two-step on purpose -- upload latency and extraction latency have
+ * very different shapes (bytes vs. an LLM round-trip with retries).
  *
  * Behavior:
  *   1. Stream the upload through `uploadFile` (sha256 + idempotent
@@ -33,7 +34,7 @@ export const dynamic = "force-dynamic";
 
 const uploadFormSchema = z.object({
   plan_id: z.string().uuid("plan_id must be a valid uuid"),
-  kind: z.enum(["participant_census", "payroll_run", "other"]),
+  kind: z.enum(["plan_pdf", "participant_census", "payroll_run", "other"]),
   uploaded_by: z.string().min(1).max(255).optional(),
 });
 

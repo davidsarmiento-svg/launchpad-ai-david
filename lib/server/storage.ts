@@ -212,6 +212,54 @@ export async function uploadFile(
   return { file: updatedRow as FileRow, created };
 }
 
+/**
+ * Pull the raw bytes for a file row back out of Storage. Used by
+ * server-side consumers (e.g. the Plan Extraction Agent) that need to
+ * hand the bytes to another API and don't want the browser involved.
+ *
+ * For browser-facing downloads use `getSignedDownloadUrl` instead --
+ * the bytes flow direct from Storage to the user without a Next.js
+ * round-trip.
+ */
+export async function downloadFileBytes(
+  file_id: string,
+): Promise<{ file: FileRow; bytes: Uint8Array }> {
+  uuid.parse(file_id);
+
+  const row = await getFileById(file_id);
+  if (!row) {
+    throw new DataLayerError({
+      module: "storage",
+      operation: "downloadFileBytes",
+      message: `no files row with id ${file_id}`,
+    });
+  }
+  if (!row.storage_path) {
+    throw new DataLayerError({
+      module: "storage",
+      operation: "downloadFileBytes",
+      message: `file ${file_id} has no storage_path - upload incomplete`,
+    });
+  }
+
+  const supabase = getSupabaseServiceRoleClient();
+  const { data, error } = await supabase.storage
+    .from(BUCKET)
+    .download(row.storage_path);
+
+  if (error || !data) {
+    throw new DataLayerError({
+      module: "storage",
+      operation: "downloadFileBytes",
+      message: error?.message ?? "Storage download returned no body",
+      cause: error,
+    });
+  }
+
+  const buf = new Uint8Array(await data.arrayBuffer());
+  return { file: row, bytes: buf };
+}
+
 export const getSignedDownloadUrlInputSchema = z.object({
   file_id: uuid,
   ttl_seconds: z

@@ -5,6 +5,10 @@ import { z } from "zod";
 import { auditLogInputSchema, writeAuditLog } from "@/lib/server/audit-log";
 import { DataLayerError } from "@/lib/server/errors";
 import {
+  importParticipants,
+  importParticipantsInputSchema,
+} from "@/lib/server/participants";
+import {
   extractedPlanFieldsJsonSchema,
   extractedPlanFieldsSchema,
 } from "@/lib/server/plan-extraction";
@@ -203,10 +207,319 @@ const writeAuditLogTool: ToolDefinition<WriteAuditLogToolInput> = {
 };
 
 // ---------------------------------------------------------------------------
+// save_participants
+// ---------------------------------------------------------------------------
+
+/**
+ * `importParticipantsInputSchema` already validates plan_id,
+ * source_file_id, and the participants array. We extend it with an
+ * optional `reason` so the agent can attach a short summary to the
+ * `PARTICIPANTS_IMPORTED` audit row -- mirrors the `reason` field on
+ * `save_plan_details`.
+ */
+const saveParticipantsInputSchema = importParticipantsInputSchema.extend({
+  reason: z.string().min(1).max(2000).optional(),
+});
+
+type SaveParticipantsInput = z.infer<typeof saveParticipantsInputSchema>;
+
+const participantItemJsonSchema = {
+  type: "object" as const,
+  properties: {
+    participant_id: {
+      type: "string",
+      description: "Census participant id, e.g. 'P0001'.",
+    },
+    employee_id: {
+      type: "string",
+      description:
+        "Employer-side employee id. Natural key for upsert.",
+    },
+    first_name: { type: "string" },
+    last_name: { type: "string" },
+    email: {
+      type: ["string", "null"],
+      description: "RFC-valid email or null.",
+    },
+    date_of_birth: {
+      type: ["string", "null"],
+      description: "ISO date YYYY-MM-DD or null.",
+    },
+    hire_date: {
+      type: ["string", "null"],
+      description: "ISO date YYYY-MM-DD or null.",
+    },
+    eligibility_status: {
+      type: ["string", "null"],
+      enum: [
+        "Eligible",
+        "Ineligible - Terminated",
+        "Pending - In Service Period",
+        "Ineligible - Other",
+        null,
+      ],
+    },
+    current_deferral_rate: {
+      type: "number",
+      minimum: 0,
+      maximum: 1,
+      description:
+        "Decimal in [0, 1]. e.g. 0.05 for 5%. NEVER pass percentage values like 5 -- the validator rejects rates above 1.",
+    },
+    roth_deferral_rate: {
+      type: "number",
+      minimum: 0,
+      maximum: 1,
+      description: "Decimal in [0, 1]. Same units as current_deferral_rate.",
+    },
+    account_balance: {
+      type: "number",
+      description: "Dollars and cents, e.g. 45200.00.",
+    },
+    loan_balance: {
+      type: "number",
+      description: "Dollars and cents, e.g. 0.00.",
+    },
+    employment_status: {
+      type: ["string", "null"],
+      enum: ["Active", "Terminated", "On Leave", "Unknown", null],
+    },
+    beneficiary_on_file: { type: "boolean" },
+  },
+  required: [
+    "participant_id",
+    "employee_id",
+    "first_name",
+    "last_name",
+  ],
+  additionalProperties: false,
+};
+
+const saveParticipants: ToolDefinition<SaveParticipantsInput> = {
+  name: "save_participants",
+  description:
+    "Bulk-upsert participants into the participants table. The upsert " +
+    "key is (plan_id, employee_id), so re-running the same import is " +
+    "idempotent. Call this exactly once per CSV. Rates must be decimals " +
+    "in [0, 1] (e.g. 0.05 for 5%) -- the validator rejects anything " +
+    "higher. Use null for any missing or unparseable nullable field; " +
+    "for unrecoverable required fields (e.g. missing employee_id), " +
+    "skip the row entirely and emit a flag_participant_issue instead.",
+  inputJsonSchema: {
+    type: "object",
+    properties: {
+      plan_id: {
+        type: "string",
+        description: "uuid of the plans row these participants belong to.",
+      },
+      source_file_id: {
+        type: "string",
+        description:
+          "uuid of the files row holding the CSV being imported. " +
+          "Optional in the underlying DAL but always supplied here so the " +
+          "audit log can trace the row back to a file.",
+      },
+      participants: {
+        type: "array",
+        minItems: 1,
+        maxItems: 10000,
+        items: participantItemJsonSchema,
+      },
+      reason: {
+        type: "string",
+        description:
+          "Optional 1-3 sentence summary of the import (e.g. 'Imported " +
+          "30 active participants; 0 issues flagged'). Becomes the " +
+          "audit-log reason.",
+      },
+    },
+    required: ["plan_id", "participants"],
+    additionalProperties: false,
+  },
+  inputSchema: saveParticipantsInputSchema,
+  async handler(input, ctx) {
+    try {
+      const result = await importParticipants({
+        plan_id: input.plan_id,
+        source_file_id: input.source_file_id,
+        participants: input.participants,
+      });
+
+      await writeAuditLog({
+        actor_type: "agent",
+        actor_name: ctx.actor_name,
+        action: "PARTICIPANTS_IMPORTED",
+        entity_type: "plan",
+        entity_id: input.plan_id,
+        after_value: {
+          source_file_id: input.source_file_id ?? null,
+          count: result.count,
+          employee_ids: result.rows.map((r) => r.employee_id),
+        },
+        reason:
+          input.reason ?? "Participants imported by participant-import-agent",
+      });
+
+      return {
+        ok: true,
+        data: {
+          count: result.count,
+          employee_ids: result.rows.map((r) => r.employee_id),
+        },
+      };
+    } catch (err) {
+      if (err instanceof DataLayerError) {
+        return { ok: false, error: err.message };
+      }
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
+// flag_participant_issue
+// ---------------------------------------------------------------------------
+
+const participantIssueCodes = [
+  "BLANK_REQUIRED_FIELD",
+  "MALFORMED_EMAIL",
+  "INVALID_DATE",
+  "RATE_AMBIGUOUS",
+  "DUPLICATE_EMPLOYEE_ID",
+  "INVALID_ENUM",
+  "OTHER",
+] as const;
+
+const flagParticipantIssueInputSchema = z.object({
+  plan_id: z.string().uuid(),
+  source_file_id: z.string().uuid(),
+  employee_id: z.string().min(1).optional(),
+  row_number: z.number().int().nonnegative().optional(),
+  issue_code: z.enum(participantIssueCodes),
+  field_name: z.string().min(1).optional(),
+  severity: z.enum(["low", "medium", "high"]).default("medium"),
+  description: z.string().min(1).max(2000),
+  expected: z.unknown().optional(),
+  actual: z.unknown().optional(),
+});
+
+type FlagParticipantIssueInput = z.infer<typeof flagParticipantIssueInputSchema>;
+
+const flagParticipantIssue: ToolDefinition<FlagParticipantIssueInput> = {
+  name: "flag_participant_issue",
+  description:
+    "Record a row-level data-quality problem you noticed while " +
+    "importing a participant census. Each call writes one audit_logs " +
+    "row with action='PARTICIPANT_DATA_QUALITY_ISSUE'. Use this for " +
+    "issues you can describe with a single code (malformed email, " +
+    "invalid date, ambiguous rate, etc.) rather than refusing to " +
+    "import the row.",
+  inputJsonSchema: {
+    type: "object",
+    properties: {
+      plan_id: { type: "string", description: "uuid of the plans row." },
+      source_file_id: {
+        type: "string",
+        description: "uuid of the files row (the CSV being imported).",
+      },
+      employee_id: {
+        type: "string",
+        description: "The row's employee_id, when known.",
+      },
+      row_number: {
+        type: "integer",
+        minimum: 0,
+        description:
+          "1-indexed CSV body row number (header is row 0). Optional.",
+      },
+      issue_code: {
+        type: "string",
+        enum: [...participantIssueCodes],
+        description:
+          "BLANK_REQUIRED_FIELD: required column was empty. " +
+          "MALFORMED_EMAIL: value looked like an email but didn't parse. " +
+          "INVALID_DATE: value couldn't be parsed to YYYY-MM-DD. " +
+          "RATE_AMBIGUOUS: bare numeric rate (assumed percent). " +
+          "DUPLICATE_EMPLOYEE_ID: same employee_id as an earlier row. " +
+          "INVALID_ENUM: value didn't match the enum for the field. " +
+          "OTHER: anything else worth surfacing.",
+      },
+      field_name: {
+        type: "string",
+        description: "The CSV column the problem is about. Optional.",
+      },
+      severity: {
+        type: "string",
+        enum: ["low", "medium", "high"],
+        description: "Defaults to 'medium'.",
+      },
+      description: {
+        type: "string",
+        description:
+          "One human-readable sentence explaining the issue. Becomes " +
+          "the audit-log reason.",
+      },
+      expected: {
+        description: "The normalized value you used. Optional.",
+      },
+      actual: {
+        description: "The raw CSV value. Optional.",
+      },
+    },
+    required: [
+      "plan_id",
+      "source_file_id",
+      "issue_code",
+      "description",
+    ],
+    additionalProperties: false,
+  },
+  inputSchema: flagParticipantIssueInputSchema,
+  async handler(input, ctx) {
+    try {
+      const row = await writeAuditLog({
+        actor_type: "agent",
+        actor_name: ctx.actor_name,
+        action: "PARTICIPANT_DATA_QUALITY_ISSUE",
+        entity_type: "file",
+        entity_id: input.source_file_id,
+        employee_id: input.employee_id,
+        field_name: input.field_name,
+        before_value: {
+          actual: input.actual,
+          issue_code: input.issue_code,
+          row_number: input.row_number,
+        },
+        after_value: { expected: input.expected },
+        reason: input.description,
+        status: input.severity,
+      });
+      return { ok: true, data: { audit_log_id: row.id } };
+    } catch (err) {
+      if (err instanceof DataLayerError) {
+        return { ok: false, error: err.message };
+      }
+      return {
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
 
-const ALL_TOOLS = [savePlanDetails, writeAuditLogTool] as const;
+const ALL_TOOLS = [
+  savePlanDetails,
+  writeAuditLogTool,
+  saveParticipants,
+  flagParticipantIssue,
+] as const;
 
 const TOOLS_BY_NAME: Record<string, ToolDefinition<unknown>> =
   Object.fromEntries(

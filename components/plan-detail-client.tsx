@@ -23,6 +23,14 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
   type ExtractedPlanFields,
   extractedPlanFieldUiHints,
 } from "@/lib/server/plan-extraction";
@@ -65,17 +73,40 @@ export type PlanDetailFile = {
   uploaded_at: string;
 };
 
+/**
+ * Subset of `ParticipantRow` the Participants table card renders.
+ * Keeping the shape narrow here means the Server Component can do the
+ * row -> view mapping in one place and the client doesn't import
+ * `server-only` modules.
+ */
+export type PlanDetailParticipant = {
+  id: string;
+  employee_id: string;
+  participant_id: string;
+  first_name: string;
+  last_name: string;
+  email: string | null;
+  eligibility_status: string | null;
+  /** numeric(5,4) round-tripped as string by supabase-js. */
+  current_deferral_rate: string;
+  /** numeric(12,2) round-tripped as string by supabase-js. */
+  account_balance: string;
+  employment_status: string | null;
+};
+
+type AgentToolCall = {
+  iteration: number;
+  tool_use_id: string;
+  name: string;
+  input: unknown;
+  result: { ok: true; data: unknown } | { ok: false; error: string };
+};
+
 type ExtractResponse = {
   plan?: PlanDetailPlan;
   stop_reason: string | null;
   iterations: number;
-  tool_calls: Array<{
-    iteration: number;
-    tool_use_id: string;
-    name: string;
-    input: unknown;
-    result: { ok: true; data: unknown } | { ok: false; error: string };
-  }>;
+  tool_calls: Array<AgentToolCall>;
 };
 
 type ExtractError = {
@@ -85,6 +116,25 @@ type ExtractError = {
   iterations?: number;
   tool_calls?: ExtractResponse["tool_calls"];
 };
+
+type ImportResponse = {
+  plan_id: string;
+  file: { id: string; filename: string; kind: string };
+  save_calls: number;
+  flag_calls: number;
+  stop_reason: string | null;
+  iterations: number;
+  tool_calls: Array<AgentToolCall>;
+};
+
+/**
+ * One shared "latest agent run" timeline that updates whether the
+ * operator just ran extraction or import. The `kind` field drives the
+ * card title so the operator always knows which run they're looking at.
+ */
+type LatestRun =
+  | { kind: "extract"; data: ExtractResponse }
+  | { kind: "import"; data: ImportResponse };
 
 const STATUS_VARIANT: Record<
   PlanDetailPlan["extraction_status"],
@@ -99,20 +149,25 @@ const STATUS_VARIANT: Record<
 export function PlanDetailClient({
   plan,
   files,
+  participants,
 }: {
   plan: PlanDetailPlan;
   files: PlanDetailFile[];
+  participants: PlanDetailParticipant[];
 }) {
   const router = useRouter();
+  // `running` holds the file_id whose agent run is currently in flight,
+  // shared across both Run extraction and Run import buttons so we can
+  // disable every other button while one is working.
   const [running, setRunning] = useState<string | null>(null);
-  const [result, setResult] = useState<ExtractResponse | null>(null);
+  const [latest, setLatest] = useState<LatestRun | null>(null);
   const [error, setError] = useState<ExtractError | string | null>(null);
 
   const planPdfs = files.filter((f) => f.kind === "plan_pdf");
 
   async function handleExtract(file_id: string) {
     setRunning(file_id);
-    setResult(null);
+    setLatest(null);
     setError(null);
     try {
       const res = await fetch(`/api/plans/${plan.id}/extract`, {
@@ -126,13 +181,43 @@ export function PlanDetailClient({
       if (!res.ok) {
         setError(body as ExtractError);
       } else {
-        setResult(body as ExtractResponse);
+        setLatest({ kind: "extract", data: body as ExtractResponse });
         // Refresh server-rendered plan/file data so the new
         // `extraction_status` + `extracted_fields` show up.
         router.refresh();
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Extraction failed");
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  async function handleImport(file_id: string) {
+    setRunning(file_id);
+    setLatest(null);
+    setError(null);
+    try {
+      const res = await fetch(
+        `/api/plans/${plan.id}/participants/import`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ file_id }),
+        },
+      );
+      const body = (await res.json().catch(() => ({}))) as
+        | ImportResponse
+        | ExtractError;
+      if (!res.ok) {
+        setError(body as ExtractError);
+      } else {
+        setLatest({ kind: "import", data: body as ImportResponse });
+        // Refresh server-rendered participants list so the table fills in.
+        router.refresh();
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Import failed");
     } finally {
       setRunning(null);
     }
@@ -169,7 +254,10 @@ export function PlanDetailClient({
             Every artifact uploaded for this plan. Click{" "}
             <span className="font-mono">Run extraction</span> on a{" "}
             <span className="font-mono">plan_pdf</span> to invoke the Plan
-            Extraction Agent.
+            Extraction Agent, or{" "}
+            <span className="font-mono">Run import</span> on a{" "}
+            <span className="font-mono">participant_census</span> to invoke
+            the Participant Import Agent.
           </CardDescription>
         </CardHeader>
         <CardContent className="flex flex-col gap-3">
@@ -200,6 +288,16 @@ export function PlanDetailClient({
                   {running === f.id ? "Extracting…" : "Run extraction"}
                 </Button>
               )}
+              {f.kind === "participant_census" && (
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={() => handleImport(f.id)}
+                  disabled={running !== null}
+                >
+                  {running === f.id ? "Importing…" : "Run import"}
+                </Button>
+              )}
             </div>
           ))}
           {planPdfs.length === 0 && files.length > 0 && (
@@ -226,53 +324,7 @@ export function PlanDetailClient({
         </Card>
       )}
 
-      {result && (
-        <Card>
-          <CardHeader>
-            <CardTitle>Latest agent run</CardTitle>
-            <CardDescription>
-              stop_reason:{" "}
-              <span className="font-mono">{result.stop_reason ?? "—"}</span>
-              {" · "}iterations:{" "}
-              <span className="font-mono">{result.iterations}</span>
-              {" · "}
-              {result.tool_calls.length} tool call
-              {result.tool_calls.length === 1 ? "" : "s"}
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="flex flex-col gap-2">
-            {result.tool_calls.map((c) => (
-              <details
-                key={c.tool_use_id}
-                className="rounded-md border border-foreground/10 bg-muted/30 px-3 py-2 text-xs"
-              >
-                <summary className="cursor-pointer">
-                  <Badge
-                    variant={c.result.ok ? "default" : "destructive"}
-                    className="mr-2"
-                  >
-                    {c.result.ok ? "ok" : "error"}
-                  </Badge>
-                  <span className="font-mono">{c.name}</span>
-                  <span className="text-muted-foreground">
-                    {" "}
-                    (iter {c.iteration})
-                  </span>
-                </summary>
-                <pre className="mt-2 overflow-auto whitespace-pre-wrap">
-                  {JSON.stringify(
-                    c.result.ok
-                      ? { input: c.input, output: c.result.data }
-                      : { input: c.input, error: c.result.error },
-                    null,
-                    2,
-                  )}
-                </pre>
-              </details>
-            ))}
-          </CardContent>
-        </Card>
-      )}
+      {latest && <LatestRunCard run={latest} />}
 
       {/*
         `key` makes the form remount whenever a new extraction lands.
@@ -285,7 +337,172 @@ export function PlanDetailClient({
         key={`${plan.id}:${plan.extraction_status}:${plan.extracted_at ?? "_"}`}
         plan={plan}
       />
+
+      <ParticipantsCard participants={participants} />
     </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Latest agent run card (shared between extract + import).
+// ---------------------------------------------------------------------------
+
+function LatestRunCard({ run }: { run: LatestRun }) {
+  const title =
+    run.kind === "extract" ? "Latest extraction run" : "Latest import run";
+  const calls = run.data.tool_calls;
+  const extraSummary =
+    run.kind === "import"
+      ? ` · save_participants ok: ${run.data.save_calls}` +
+        ` · flag_participant_issue ok: ${run.data.flag_calls}`
+      : "";
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>{title}</CardTitle>
+        <CardDescription>
+          stop_reason:{" "}
+          <span className="font-mono">{run.data.stop_reason ?? "—"}</span>
+          {" · "}iterations:{" "}
+          <span className="font-mono">{run.data.iterations}</span>
+          {" · "}
+          {calls.length} tool call{calls.length === 1 ? "" : "s"}
+          {extraSummary}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-2">
+        {calls.map((c) => (
+          <details
+            key={c.tool_use_id}
+            className="rounded-md border border-foreground/10 bg-muted/30 px-3 py-2 text-xs"
+          >
+            <summary className="cursor-pointer">
+              <Badge
+                variant={c.result.ok ? "default" : "destructive"}
+                className="mr-2"
+              >
+                {c.result.ok ? "ok" : "error"}
+              </Badge>
+              <span className="font-mono">{c.name}</span>
+              <span className="text-muted-foreground">
+                {" "}
+                (iter {c.iteration})
+              </span>
+            </summary>
+            <pre className="mt-2 overflow-auto whitespace-pre-wrap">
+              {JSON.stringify(
+                c.result.ok
+                  ? { input: c.input, output: c.result.data }
+                  : { input: c.input, error: c.result.error },
+                null,
+                2,
+              )}
+            </pre>
+          </details>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Participants card.
+// ---------------------------------------------------------------------------
+
+const CURRENCY_FORMAT = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+});
+
+function formatRate(rate: string | number): string {
+  const n = Number(rate);
+  if (!Number.isFinite(n)) return "—";
+  return `${(n * 100).toFixed(2)}%`;
+}
+
+function formatMoney(amount: string | number): string {
+  const n = Number(amount);
+  if (!Number.isFinite(n)) return "—";
+  return CURRENCY_FORMAT.format(n);
+}
+
+function ParticipantsCard({
+  participants,
+}: {
+  participants: PlanDetailParticipant[];
+}) {
+  const count = participants.length;
+  const description =
+    count === 0
+      ? "No participants imported yet."
+      : count === 200
+        ? `Showing first 200 (table capped for performance).`
+        : `${count} participant${count === 1 ? "" : "s"}`;
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Participants</CardTitle>
+        <CardDescription>{description}</CardDescription>
+      </CardHeader>
+      <CardContent>
+        {count === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No participants imported yet — upload a{" "}
+            <span className="font-mono">participant_census</span> and click
+            Run import.
+          </p>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>employee_id</TableHead>
+                <TableHead>name</TableHead>
+                <TableHead>email</TableHead>
+                <TableHead>eligibility_status</TableHead>
+                <TableHead className="text-right">
+                  current_deferral_rate
+                </TableHead>
+                <TableHead className="text-right">account_balance</TableHead>
+                <TableHead>employment_status</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {participants.map((p) => (
+                <TableRow key={p.id}>
+                  <TableCell className="font-mono">{p.employee_id}</TableCell>
+                  <TableCell>
+                    {p.first_name} {p.last_name}
+                  </TableCell>
+                  <TableCell className="font-mono">
+                    {p.email ?? (
+                      <span className="text-muted-foreground">null</span>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    {p.eligibility_status ?? (
+                      <span className="text-muted-foreground">null</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-right font-mono">
+                    {formatRate(p.current_deferral_rate)}
+                  </TableCell>
+                  <TableCell className="text-right font-mono">
+                    {formatMoney(p.account_balance)}
+                  </TableCell>
+                  <TableCell>
+                    {p.employment_status ?? (
+                      <span className="text-muted-foreground">null</span>
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

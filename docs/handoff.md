@@ -51,6 +51,11 @@ Before writing any code, read these in this order:
 ## 3. Current commit graph
 
 ```text
+3dda65a Phase 8: Participant Import Agent
+ddaca3f Phase 7.5: extracted-fields approval flow
+eb55f79 Phase 7: Plan Extraction Agent end-to-end with tool-use loop
+bfca954 Phase 6: multipart upload + Supabase Storage with sha256 dedupe
+f07b412 Phase 5: typed data access layer
 1898058 Add domain schema migration for participants, payroll, and reconciliation
 43ff54e Init Supabase + first migration for audit_logs
 6a3d519 Server foundation: env validation, Supabase + Anthropic clients, /api/health
@@ -59,33 +64,25 @@ c4b7cdb Session 3 scaffold: UI kit, theme, hello API route, deployment guide
 f01795d Initial scaffold: Next.js + shadcn
 ```
 
-Branch `main` is up to date with `origin/main` at
-https://github.com/davidsarmiento-svg/launchpad-ai-david.
+Branch `main` is **5 commits ahead** of `origin/main` at
+https://github.com/davidsarmiento-svg/launchpad-ai-david — push when
+ready. All five new commits have lint + build clean.
 
-> **Uncommitted (Phases 5 + 6 + 7)**:
->
-> *Server modules* — `lib/server/{errors,http,audit-log,plans,files,participants,storage,plan-extraction}.ts`,
-> `lib/server/agents/{run,skills}.ts`,
-> `lib/server/tools/registry.ts`.
->
-> *Migrations* — `20260523000000_init_storage_bucket.sql` (already
-> applied to launchpad-dev). Prod still un-migrated.
->
-> *Route Handlers* — `/api/health` (probes `audit_logs`),
-> `/api/plans` (GET + POST), `/api/upload` (multipart, accepts
-> `plan_pdf` as of Phase 7), `/api/plans/[id]/extract` (Plan
-> Extraction Agent with 60 s max duration).
->
-> *UI* — `app/page.tsx` (`force-dynamic`), `app/plans/[id]/page.tsx`,
-> `components/{upload-card,upload-card-client,plan-detail-client}.tsx`.
->
-> *Skills* — `skills/plan-extraction/SKILL.md`.
->
-> Lint + build pass. End-to-end runs against launchpad-dev: upload
-> happy + dedupe (Phase 6), extraction against the real
-> `mock-plan-document.pdf` returns every expected field, catches all
-> four planted gotchas, and writes both `PLAN_CREATED` + `PLAN_DETAILS_EXTRACTED`
-> audit rows. See §4.10. Commit before the next session.
+End-to-end signals against launchpad-dev:
+
+- *Phase 6* — upload happy + dedupe verified via curl.
+- *Phase 7* — extraction against `mock-plan-document.pdf` returns every
+  expected field, catches all four planted gotchas, writes
+  `PLAN_CREATED` + `PLAN_DETAILS_EXTRACTED` audit rows. See §4.10.
+- *Phase 7.5* — approve happy path with a `default_deferral_rate
+  3% → 4%` edit lands `extraction_status='approved'`,
+  `plans.status='active'`, audit row's `before_value`/`after_value`
+  carries the diff. Negative cases (404, 400 EIN regex, 400 empty
+  reason, 409 already-approved) all return the right status. See §4.11.
+- *Phase 8* — clean 30-row `participant-census.csv` import lands 30
+  rows in `participants` (rates as decimals, ISO dates, boolean
+  beneficiary), `PARTICIPANTS_IMPORTED` audit per run, idempotent
+  re-run. Negative `wrong_file_kind` returns 400. See §4.12.
 
 ---
 
@@ -557,64 +554,126 @@ See §4.10 for what shipped. End-to-end works against the real Acme
 PDF; all four planted gotchas handled correctly. Skill file is the
 prompt; tweak `skills/plan-extraction/SKILL.md` to iterate.
 
-### 7.6 Phase 7.5 — Plan approval flow (small follow-up to Phase 7)
-The agent leaves the row at `extraction_status='in_review'`. There is
-intentionally no UI yet to (a) edit a field the agent got wrong or
-(b) flip the row to `'approved'` / `'failed'`. Build that next so the
-human-in-the-loop story is complete:
+### 7.6 Phase 7.5 — Plan approval flow (DONE, commit `ddaca3f`)
 
-1. Add `lib/server/plans.ts#approveExtractedFields(id, {fields,
-   reason, approver_name})` — updates the row to
-   `extraction_status='approved'`, writes a `PLAN_DETAILS_APPROVED`
-   audit row whose `before_value` is the agent's snapshot and
-   `after_value` is the human's (so any edits show up as a diff).
-   Symmetrical `rejectExtractedFields(...)` flips to `'failed'`.
-2. Add `PATCH /api/plans/[id]/extracted-fields` for approval and
-   `POST /api/plans/[id]/extracted-fields/reject` for rejection.
-3. In `plan-detail-client.tsx`, swap the read-only table for inline
-   editable cells when `extraction_status === 'in_review'`, and add
-   Approve / Reject buttons. After approval, also flip `plans.status`
-   to `'active'` (or `'in_review'` if the rest of onboarding still
-   has open items).
+Shipped. Operator can now edit the agent's extracted fields, approve
+(→ `extraction_status='approved'`, `plans.status='active'`), or reject
+with a required reason (→ `extraction_status='failed'`).
 
-### 7.7 Phase 8 — Participant Import Agent (NEXT-NEXT)
-Now that the agent pattern is proven, repeat it for the participant
-census CSV:
+- `lib/server/plans.ts#approveExtractedFields` /
+  `rejectExtractedFields` — atomic UPDATE filtered on
+  `extraction_status='in_review'` so a stale tab can't double-flip.
+  Re-runs `extractedPlanFieldsSchema` on the human edits.
+- `lib/server/errors.ts` — `NotFoundError` + `ConflictError` subclasses
+  of `DataLayerError`; `lib/server/http.ts` now translates them to 404
+  / 409 (instance check ordering matters since they extend
+  `DataLayerError`).
+- `lib/server/plan-extraction.ts` — dropped `import "server-only"`
+  (the schema is pure data + Zod; safe to import in client form). Added
+  `extractedPlanFieldUiHints` map (`kind`/`nullable`/`hint` per field)
+  so the UI rendering and the agent spec stay one diff away.
+- `app/api/plans/[id]/extracted-fields/route.ts` (PATCH approve) and
+  `.../reject/route.ts` (POST reject) — thin handlers that wrap the
+  DAL and write audit rows with structured before/after pairs.
+- `components/plan-detail-client.tsx` — `<ExtractedFieldsCard>` with
+  type-aware inputs (text/textarea/number/integer/checkbox) when
+  `in_review`, read-only otherwise. The card uses a `key` prop on the
+  parent so a fresh extraction remounts the form (React-19-correct
+  alternative to `setState`-in-`useEffect`). Reject button opens a
+  `<Dialog>` requiring a reason.
 
-1. New skill: `skills/participant-import/SKILL.md`.
-   Inputs: the CSV bytes + the existing `participant-census.csv`
-   structure. Outputs: an array of normalized participant rows.
-2. New tools: `save_participants` (wraps `importParticipants`),
-   `flag_participant_issue` (writes a `data_quality`
-   reconciliation_issues row for things like malformed emails the
-   agent spotted in the census itself).
-3. New route: `POST /api/plans/[id]/participants/import` taking a
-   `file_id` of an already-uploaded `participant_census` file.
-4. UI: extend `plan-detail-client.tsx` with a "Run import" button
-   next to participant_census files, and a participant table below.
+Plan-status assumption: approve flips `plans.status` to `'active'`.
+Today this is the only onboarding gate. Once Payroll Reconciliation
+lands its own gates, revisit the docstring on
+`approveExtractedFields` — it may need to land on `'in_review'`
+instead until those gates also clear.
 
-Watch-outs from the demo CSVs:
-- Rates come in as `"5%"` strings; the CSV parser (not the data
-  layer) converts to `0.05`. The agent should do the conversion in
-  its `save_participants` payload, NOT ask the tool to do it.
-- The natural key is `(plan_id, employee_id)` — `importParticipants`
-  is already an upsert on that key, so re-running the import after a
-  fix is safe.
+Verification:
+
+| Case | Result |
+|---|---|
+| Approve happy (3% → 4% edit) | 200; status=approved, plans.status=active; audit before/after diff |
+| Approve unknown plan id | 404 NotFoundError |
+| Approve already-approved plan | 409 ConflictError |
+| Approve with bad EIN regex | 400 with structured Zod issue |
+| Reject with empty reason | 400 with structured Zod issue |
+
+### 7.7 Phase 8 — Participant Import Agent (DONE, commit `3dda65a`)
+
+Shipped. Reads a participant census CSV, normalizes (rates as decimals,
+ISO dates, enum values, boolean beneficiary), upserts via
+`importParticipants`. Census-time data-quality issues land in
+`audit_logs` with `action=PARTICIPANT_DATA_QUALITY_ISSUE` —
+deliberately **not** in `reconciliation_issues` (see decision below).
+
+- `skills/participant-import/SKILL.md` — schema table cites
+  `participantInputSchema`; conflict rules cover blank required
+  fields, malformed emails, ambiguous bare-number rates, duplicate
+  `(plan_id, employee_id)`, unknown enums, unparseable dates,
+  beneficiary normalization.
+- `lib/server/tools/registry.ts` — `save_participants` (extends
+  `importParticipantsInputSchema` with optional `reason`, writes a
+  `PARTICIPANTS_IMPORTED` audit row) and `flag_participant_issue`
+  (structured `audit_logs` row with `field_name`, `employee_id`,
+  `severity` → `status`, before/after carrying actual/expected). Both
+  lock `actor_type=agent` with the runner-supplied `actor_name` so
+  the model can't forge attribution.
+- `app/api/plans/[id]/participants/import/route.ts` —
+  `maxDuration=60`, `max_tokens=16000` (see watch-out below). Decodes
+  CSV as UTF-8 text and embeds in a single text block (CSVs are text;
+  no `document` attachment). Failure path mirrors the extract route:
+  `PARTICIPANT_IMPORT_FAILED` audit + 500 with full `tool_calls`.
+- `app/plans/[id]/page.tsx` + `components/plan-detail-client.tsx` —
+  Run import button next to `participant_census` files (mirrors the
+  `plan_pdf` button), unified `LatestRunCard` timeline that swaps
+  between extract/import runs, and a Participants `<Table>` with
+  formatted rate (`%`) and balance (currency) columns.
+
+**Decision: census issues live in `audit_logs` only for now.**
+Original plan called for `reconciliation_issues` rows but
+`payroll_run_id NOT NULL` would force a schema migration. We chose
+maximum optionality — keep census issues browsable via the audit
+trail until Phase 9 builds the unified Issues tab and we know the
+queries the UI will run. The deferred follow-up:
+
+- New migration: relax `reconciliation_issues.payroll_run_id` to
+  nullable, add optional `plan_id`, `CHECK (payroll_run_id IS NOT NULL
+  OR plan_id IS NOT NULL)`. Then `flag_participant_issue` writes
+  there alongside `audit_logs`.
+- Backfill the census-issue audit rows we accumulated this phase into
+  the new table (one-shot script, not a migration).
+
+**Watch-out: agent `max_tokens` budget.** The route sets
+`max_tokens: 16000` because `save_participants` for a 30-row census
+already wants ~5k tokens of structured tool_use input plus reasoning.
+The `runAgent` default of 4096 silently fails as
+`stop_reason=max_tokens` with an empty `tool_calls` log; the failure
+path correctly writes `PARTICIPANT_IMPORT_FAILED` so the operator
+sees a useful breadcrumb. **Any future agent whose tool input is
+bulk-row JSON should bump `max_tokens` at the route call site** —
+the runAgent default is fine for scalar-output agents like plan
+extraction.
+
+Verification:
+
+| Case | Result |
+|---|---|
+| Clean 30-row census, happy import | 200; 30 rows; 1 PARTICIPANTS_IMPORTED audit; 0 flags; end_turn after 2 iterations |
+| Re-run same import | 200; count stays 30 (idempotent upsert); second audit row |
+| `wrong_file_kind` (plan_pdf as census) | 400 |
 
 ### 7.8 Phase 9 — remaining agents
 Payroll Mapping → Payroll Reconciliation → Onboarding Assistant.
 Each adds tools to the registry; reuse skills where they overlap.
+Build the unified Issues tab here and apply the deferred
+`reconciliation_issues` migration described in §7.7 once the
+worklist UI is designed.
 
-### 7.6 Phase 8 — remaining agents
-After the Plan Extraction Agent ships end to end, repeat the pattern
-for: Participant Import → Payroll Mapping → Payroll Reconciliation →
-Onboarding Assistant. Each adds tools to the registry; reuse skills
-where they overlap (e.g., `skills/audit-logging/SKILL.md` is shared
-by all).
-
-### 7.7 Eventually: production deploy alignment
+### 7.9 Eventually: production deploy alignment
 - Reconnect GitHub in the Vercel dashboard so pushes auto-deploy.
-- Apply migrations to launchpad-prod.
+- Apply migrations to launchpad-prod (now three: audit_logs, domain
+  schema, storage bucket).
+- Push the five new commits to `origin/main` (`git push`).
 - Run the smoke tests from
   [docs/deployment-and-production-readiness.md §End-To-End Pre-Launch Checklist](deployment-and-production-readiness.md).
 - Turn off Vercel deployment protection if the demo URL should be
